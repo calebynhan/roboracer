@@ -36,6 +36,16 @@ around an obstacle, one per raceline point) instead of the raceline; speeds stay
 path yet, a path older than max_path_age s, one of another length, or /local_path/valid false (no
 collision-free path) gets a stop command.
 
+Off by default (each needs a sim benchmark before it is turned on):
+  latency               s: the pose is predicted this far ahead (plus its own age) at the /odom speed and yaw
+                        rate before the target is picked, for the delay between a pose and its command acting
+  speed_preview_time    s: the speed is the raceline's at the car's position plus planned speed x this, instead
+                        of at the target point (which brakes early into corners and overspeeds on exits); < 0 = off
+  accel_feedforward     /drive acceleration = the raceline's ax (x speed_scale^2) at that point, for the
+                        adapter's speed_ka; 0 when max_speed caps the speed
+  avoid_max_lateral_accel  m/s^2: with avoid, the speed is capped at sqrt(this / curvature) of /local_path
+                        between the car and the target, so a swerve is not driven at the raceline's speed; 0 = off
+
 Which line it drives: on start it logs the raceline's provenance (build_raceline's '# raceline:' header
 line: method, solver, fallbacks) and WARNs unless it is a clean TUM mintime line, also when the
 provenance is unknown (older or hand-made files). /raceline/provenance (latched String) repeats it.
@@ -52,16 +62,18 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.signals import SignalHandlerOptions
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
+from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, String
 
 from perception.tracks import track_dir
 from planning.raceline import read_provenance
 
-from control.lookahead import curvature_cap, lookahead
+from control.lookahead import curvature_cap, lookahead, path_curvature
+from control.motion import predict_pose
 
 # raceline.csv columns: s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2
-X, Y, VX = 1, 2, 5
+X, Y, VX, AX = 1, 2, 5, 6
+MAX_ODOM_AGE = 0.2   # s: older /odom is not used to predict the pose
 
 
 class PurePursuit(Node):
@@ -90,6 +102,10 @@ class PurePursuit(Node):
         self.max_offset = p('max_offset', 3.0).value       # m from the line, farther = bad pose
         self.avoid = p('avoid', False).value               # follow /local_path instead of the raceline
         self.max_path_age = p('max_path_age', 0.5).value   # s
+        self.latency = p('latency', 0.0).value             # s the pose is predicted ahead, 0 = off
+        self.speed_preview_time = p('speed_preview_time', -1.0).value   # s, < 0: speed at the target point
+        self.accel_ff = p('accel_feedforward', False).value           # raceline ax in /drive acceleration
+        self.avoid_max_ay = p('avoid_max_lateral_accel', 0.0).value   # m/s^2 on /local_path, 0 = off
         # vehicle geometry comes only from config/vehicle.yaml (pure_pursuit.launch.py loads it)
         self.max_steering_angle = p('max_steering_angle', Parameter.Type.DOUBLE).value
         self.wheelbase = p('wheelbase', Parameter.Type.DOUBLE).value
@@ -113,11 +129,14 @@ class PurePursuit(Node):
         seg = np.roll(self.xy, -1, axis=0) - self.xy
         self.heading = np.arctan2(seg[:, 1], seg[:, 0])
         step = np.median(np.hypot(seg[:, 0], seg[:, 1]))
+        self.step = step
         self.window = max(1, int(np.ceil(search_window / step))) if step > 0 else len(self.xy)
         self.cap = (curvature_cap(self.xy, la_cut, la_slope, self.lookahead_min, self.lookahead_distance, la_smooth)
                     if adaptive else np.full(len(self.xy), np.inf))
         self.closest = None
         self.path_xy, self.path_stamp, self.path_valid = None, 0.0, False
+        self.path_kappa = None
+        self.odom = None           # (clock time, speed, yaw rate) of the newest /odom, for latency
         self.last_pose = None      # s, clock time of the last pose that got a command
         self.get_logger().info(f'Loaded {path}: {len(self.waypoints)} points; lookahead '
                                f'{self.lookahead_time} s x speed, {self.lookahead_min}-{self.lookahead_distance} m'
@@ -132,6 +151,9 @@ class PurePursuit(Node):
             self.create_subscription(Path, '/local_path', self.path_callback, 10)
             self.create_subscription(Bool, '/local_path/valid', self.valid_callback, 10)
             self.get_logger().info('Avoiding obstacles: following /local_path')
+        if self.latency > 0:
+            self.create_subscription(Odometry, p('odom_topic', '/odom').value, self.odom_callback, 10)
+            self.get_logger().info(f'Latency compensation: pose predicted {self.latency:.3f} s ahead')
         self.create_timer(0.05, self.watchdog)
 
     def report_provenance(self, path):
@@ -170,7 +192,14 @@ class PurePursuit(Node):
             self.path_xy = None
             return
         self.path_xy = np.array([[q.pose.position.x, q.pose.position.y] for q in msg.poses])
+        if self.avoid_max_ay > 0:
+            self.path_kappa = path_curvature(self.path_xy, 0.5)
         self.path_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+
+    def odom_callback(self, msg: Odometry):
+        v, w = msg.twist.twist.linear.x, msg.twist.twist.angular.z
+        if np.isfinite([v, w]).all():
+            self.odom = (self.now(), v, w)
 
     def valid_callback(self, msg: Bool):
         self.path_valid = msg.data
@@ -226,6 +255,9 @@ class PurePursuit(Node):
         if age > self.max_pose_age:
             return self.stop(f'pose {age:.2f} s old')
         yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2))
+        if self.latency > 0 and self.odom is not None and self.now() - self.odom[0] <= MAX_ODOM_AGE:
+            # where the car will be when this command acts: the pose's own age plus the actuation latency
+            x, y, yaw = predict_pose(x, y, yaw, self.odom[1], self.odom[2], self.latency + max(age, 0.0))
 
         xy = self.xy
         if self.avoid:
@@ -274,14 +306,29 @@ class PurePursuit(Node):
         target_y = -dx * np.sin(yaw) + dy * np.cos(yaw)
         steering = np.arctan(self.wheelbase * 2 * target_y / target_dist ** 2)
 
-        speed = self.drive_speed(target)
-        if not (np.isfinite(steering) and np.isfinite(speed)):
+        if self.speed_preview_time >= 0 and self.step > 0:
+            ahead_pts = int(round(self.drive_speed(closest) * self.speed_preview_time / self.step))
+            at = (closest + ahead_pts) % n
+        else:
+            at = target
+        speed = self.drive_speed(at)
+        if self.avoid and self.path_kappa is not None:
+            k = far[0] if far.size else int(np.argmax(dists[ahead]))
+            kappa = float(np.max(self.path_kappa[ahead[:k + 1]]))
+            if kappa > 1e-6:
+                speed = min(speed, float(np.sqrt(self.avoid_max_ay / kappa)))
+        accel = 0.0
+        uncapped = self.max_speed <= 0 or self.waypoints[at, VX] * self.speed_scale < self.max_speed
+        if self.accel_ff and uncapped and speed == self.drive_speed(at):   # not when max_speed or the swerve cap holds it
+            accel = float(self.waypoints[at, AX]) * self.speed_scale ** 2
+        if not (np.isfinite(steering) and np.isfinite(speed) and np.isfinite(accel)):
             return self.stop(f'non-finite command: steering {steering}, speed {speed}')
         drive = AckermannDriveStamped()
         drive.header.stamp = self.get_clock().now().to_msg()
         drive.header.frame_id = 'base_link'
         drive.drive.steering_angle = float(np.clip(steering, -self.max_steering_angle, self.max_steering_angle))
         drive.drive.speed = float(speed)
+        drive.drive.acceleration = accel
         self.drive_pub.publish(drive)
 
 

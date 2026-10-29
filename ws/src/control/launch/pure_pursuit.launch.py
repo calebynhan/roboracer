@@ -2,7 +2,8 @@
 
     ros2 launch control pure_pursuit.launch.py track:=<name> [pose_topic:=/localized_pose] [speed_scale:=0.5]
         [max_speed:=0.0] [avoid:=false] [adaptive_lookahead:=true] [adaptive_lookahead_cut:=0.1]
-        [adaptive_lookahead_min_time:=0.25]
+        [adaptive_lookahead_min_time:=0.25] [latency:=0.0] [speed_preview_time:=-1.0] [accel_feedforward:=false]
+        [avoid_max_lateral_accel:=0.0]
 
 Follows $TRACKS_DIR/<name>/raceline.csv (default ~/ws/tracks). Needs localization publishing pose_topic
 (/localized_pose: perception's localization_gate or mcl_node, so the car waits until it is localized).
@@ -35,6 +36,14 @@ def generate_launch_description():
                               description='with adaptive_lookahead: corner cut [m], lookahead <= sqrt(2 cut / kappa)'),
         DeclareLaunchArgument('adaptive_lookahead_min_time', default_value='0.25',
                               description='with adaptive_lookahead: but lookahead >= min_time x speed [s]'),
+        DeclareLaunchArgument('latency', default_value='0.0',
+                              description='s the pose is predicted ahead (actuation latency), 0 = off'),
+        DeclareLaunchArgument('speed_preview_time', default_value='-1.0',
+                              description='speed at the car + planned speed x this [s] instead of at the target; < 0 = off'),
+        DeclareLaunchArgument('accel_feedforward', default_value='false',
+                              description='raceline ax in /drive acceleration (adapter speed_ka)'),
+        DeclareLaunchArgument('avoid_max_lateral_accel', default_value='0.0',
+                              description='with avoid: speed <= sqrt(this / curvature) of /local_path [m/s^2], 0 = off'),
         Node(
             package='control',
             executable='pure_pursuit_node',
@@ -50,6 +59,10 @@ def generate_launch_description():
                     LaunchConfiguration('adaptive_lookahead_cut'), value_type=float),
                 'adaptive_lookahead_min_time': ParameterValue(
                     LaunchConfiguration('adaptive_lookahead_min_time'), value_type=float),
+                'latency': ParameterValue(LaunchConfiguration('latency'), value_type=float),
+                'speed_preview_time': ParameterValue(LaunchConfiguration('speed_preview_time'), value_type=float),
+                'accel_feedforward': ParameterValue(LaunchConfiguration('accel_feedforward'), value_type=bool),
+                'avoid_max_lateral_accel': ParameterValue(LaunchConfiguration('avoid_max_lateral_accel'), value_type=float),
             }],
         ),
     ])
