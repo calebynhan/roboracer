@@ -8,6 +8,8 @@ adapter:
     laser_x: 0.2733             # rear axle -> lidar
     speed_kff: 0.04             # throttle per m/s; the throttle is motor torque, settling at ~25 m/s per unit
     speed_kp: 0.006
+    speed_ka: 0.0               # throttle per m/s^2 of /drive acceleration (pure pursuit's accel_feedforward); 0 = off, identify first
+    steering_gain: 1.0          # measured / bicycle-model curvature from steering_monitor (repo notes suggest ~1.8); 1.0 = off
     speed_kp_brake: 0.03        # kp when faster than /drive: 8 -> 3 m/s gives throttle -0.03 (brakes). 0.1 turned /odom
                                 # noise (std 0.16 m/s vs ground truth) into brake taps: 88 surge/brake swings in 24 s on Porto
     speed_ki: 0.006

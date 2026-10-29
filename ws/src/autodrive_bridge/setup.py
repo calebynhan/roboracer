@@ -27,6 +27,7 @@ setup(
             'adapter = autodrive_bridge.adapter:main',
             'wheel_odom = autodrive_bridge.wheel_odom:main',
             'teleop_keyboard = autodrive_bridge.teleop_keyboard:main',
+            'steering_monitor = autodrive_bridge.steering_monitor:main',
         ],
     },
 )
