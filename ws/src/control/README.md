@@ -7,8 +7,13 @@ through it and drives at the raceline speed scaled by `speed_scale`. The speed i
 waypoint, not the closest one: the car brakes early into corners, but on corner exits it can exceed the
 profile at its own position near `speed_scale` 1.0. With `adaptive_lookahead:=true` the lookahead is
 also capped by the curvature of the raceline near the car, so at speed it does not cut corners (on by
-default, `adaptive_lookahead:=false` turns it off; see Adaptive lookahead below). See `docs/pipeline.md` for where
-it sits in the stack.
+default, `adaptive_lookahead:=false` turns it off; see Adaptive lookahead below). Five more options are off by
+default (Options, below). See `docs/pipeline.md` for where it sits in the stack.
+
+Tools around it: `lap_logger_node` and `ws/scripts/benchmark.sh` measure every lap (Lap benchmark),
+`tune_sectors` sets the speed per sector from those laps, `sysid_recorder_node` and `fit_vehicle` measure the car
+(Vehicle identification), `safety_node` brakes for what the lidar sees in the car's path (Emergency brake), and
+`car.launch.py` adds what the real car needs to f1tenth_system (Real car).
 
 `follow_the_gap_node` is a reactive alternative that needs no map: it steers toward the farthest point
 (the middle of the run of farthest beams, since ranges are capped at `max_range`) of the widest free
@@ -26,6 +31,8 @@ ros2 launch control pure_pursuit.launch.py track:=<name>
 ros2 launch control pure_pursuit.launch.py track:=<name> speed_scale:=0.3
 ros2 launch control race.launch.py track:=<name> avoid:=true   # + obstacle avoidance
 ros2 launch control race.launch.py track:=<name> speed_scale:=1.0   # adaptive lookahead is on by default
+ros2 launch control race.launch.py track:=<name> sector_speeds:=true safety:=true   # tuned sectors, emergency brake
+ros2 launch control race.launch.py track:=<name> vehicle:=$(ros2 pkg prefix control)/share/control/config/vehicle_car.yaml
 ```
 
 Localization must be running: the default pose topic is `/localized_pose` (perception's
@@ -66,7 +73,8 @@ not fire while racing. Ctrl-C publishes 0.5 s of 20 Hz stops before exiting.
 These are coarse. Cartographer extrapolates `/tracked_pose` (`use_pose_extrapolator` defaults to true;
 `pose_publish_period_sec` 1e-2), so its stamps stay fresh even when SLAM stalls: the age check only
 catches DDS backlog or a non-Cartographer publisher. `max_offset` only catches gross errors: a wrong
-pose on a nearby leg (iros2026's legs are 1.07 m apart) passes it. There is no `/scan`-based stop.
+pose on a nearby leg (iros2026's legs are 1.07 m apart) passes it. The `/scan`-based stop is `safety_node`
+(Emergency brake): `race.launch.py safety:=true`, and on the real car `car.launch.py`.
 
 ## Topics
 
@@ -76,6 +84,7 @@ pose on a nearby leg (iros2026's legs are 1.07 m apart) passes it. There is no `
 | `/drive` | `ackermann_msgs/AckermannDriveStamped` | published, one command per pose (and the watchdog's stops) |
 | `/local_path` | `nav_msgs/Path` | subscribed with `avoid`, the path steered on |
 | `/local_path/valid` | `std_msgs/Bool` | subscribed with `avoid`, false = stop |
+| `/odom` | `nav_msgs/Odometry` | subscribed with `latency` > 0: the speed for the prediction |
 
 ## Parameters
 
@@ -102,6 +111,14 @@ pose on a nearby leg (iros2026's legs are 1.07 m apart) passes it. There is no `
 | `max_offset` | `3.0` | m; farther than this from the raceline, the pose is taken as bad and the car stops |
 | `avoid` | `false` | steer on `/local_path` (obstacle avoidance) instead of the raceline |
 | `max_path_age` | `0.5` | s; with `avoid`, an older `/local_path` gets a stop |
+| `latency` | `0.0` | s from a `/drive` to the car acting on it (`fit_vehicle`); > 0: the pose is predicted to then (Options) |
+| `odom_topic` | `/odom` | with `latency`: the speed |
+| `speed_preview_time` | `-1.0` | s; >= 0: the speed is the profile's at the car's closest point plus planned speed x this, not at the target |
+| `accel_feedforward` | `false` | `/drive` acceleration = the profile's (for the sim adapter's `speed_ka`); 0 while `max_speed` or the swerve cap holds the speed |
+| `sector_speeds` | `false` | the speed profile x `tracks/<track>/sectors.yaml` (`tune_sectors`) |
+| `sectors_path` | `''` | another sectors file. Node parameter only |
+| `avoid_max_lateral_accel` | `0.0` | m/s^2; with `avoid`, the speed where `/local_path` leaves the raceline is capped at sqrt(this / its curvature); 0 = off |
+| `avoid_max_decel` | `3.5` | m/s^2 braking into that cap. Node parameter only |
 | `wheelbase` | none | m, from `config/vehicle.yaml` (required) |
 | `max_steering_angle` | none | rad, steering is clipped to this; from `config/vehicle.yaml` (required) |
 
@@ -131,6 +148,142 @@ With `avoid:=true` the cap is still the raceline's (per raceline point, which `/
 one), not the curvature of `/local_path`'s swerve around an obstacle.
 Sim (MCL, 2026-10-29): Porto at 1.0, 0 collisions in 23 laps of 7.00 s (off: 25 collisions in 180 s);
 Berlin at 1.0, 0 collisions, 12.38 s laps (off: 30 collisions); lap times at 0.5 unchanged.
+
+### Options
+
+Each is off by default; turn one on at a time and compare laps (`benchmark.sh`, below). `test_closed_loop.py`
+drives the node closed loop against a kinematic bicycle car (`test/sim_car.py`: no tires or slip) to check what
+each does to that model; what they are worth in AutoDRIVE or on the car is for the benchmark.
+
+- `latency` (s): a command acts on the car that much later (`fit_vehicle` measures it). The pose is first driven
+  forward to then, from its stamp, with the commands this node sent that act meanwhile (a Smith predictor; their
+  curvature is tan(steering) / wheelbase, so calibrate the steering first). Pure pursuit turns in early and a small
+  delay offsets some of that: on the kinematic car (stadium, 1.5 m half turns, 4 m/s) the RMS distance from the
+  line is 0.033 m without delay, 0.015-0.018 m with 0.05-0.1 s, 0.12 m with 0.15 s, 0.25 m with 0.2 s and 0.65 m
+  with 0.3 s (it weaves), and 0.033 m with any of them compensated. So leave it off below ~0.1 s (the sim's delay
+  is tens of ms) and turn it on from ~0.15 s (a real car's servo, VESC and lidar together can reach that).
+- `speed_preview_time` (s): the speed is taken at the car's own point plus planned speed x this, instead of at
+  the target point (which brakes early into corners and runs over the profile out of them).
+- `accel_feedforward`: `/drive`'s acceleration carries the profile's, for the sim adapter's throttle feedforward
+  (`speed_ka`, `fit_vehicle` fits it). On the car f1tenth_system's `ackermann_to_vesc` drives the speed only.
+- `sector_speeds`: the speed profile x a scale per sector (Speed per sector, below).
+- `avoid_max_lateral_accel` (m/s^2): with `avoid`, a swerve round an obstacle is no longer driven at the
+  raceline's speed: where `/local_path` leaves the raceline the speed is capped at sqrt(this / its curvature),
+  braking into it at `avoid_max_decel`. Set it at about what the raceline was planned with (racecar.ini `ay_safe`,
+  or `mue` x g).
+
+On the same kinematic car the lookahead floor `adaptive_lookahead_min_time` decides how much pure pursuit cuts
+at speed: at 7 m/s, 0.25 s (the default) 0.14 m RMS, 0.18 s 0.05 m, 0.12 s 0.02 m. The floor is there because a
+short lookahead makes pure pursuit oscillate on a car with tires, which that model does not have: it is the next
+thing to benchmark in AutoDRIVE, not a default to change on this evidence.
+
+## Lap benchmark
+
+`lap_logger_node` writes one row per flying lap to `tracks/<name>/laps.csv` and one per lap and sector to
+`laps_sectors.csv`; `ws/scripts/benchmark.sh` races N laps with it unattended and prints the run next to the
+track's earlier ones (`lap_summary`). A lap ends where the car crosses the raceline's s = 0 forward (the first
+crossing starts the first lap); a sim respawn or reset marks the lap as interrupted.
+
+```bash
+scripts/benchmark.sh <name> --laps 5 --tag baseline speed_scale:=1.0    # race.sh + lap_logger_node, then lap_summary
+scripts/benchmark.sh <name> --laps 5 --tag preview speed_scale:=1.0 speed_preview_time:=0.1
+ros2 run control lap_summary <name> [<name> ...] [--last N]              # the runs side by side
+ros2 run control lap_logger_node --ros-args -p track:=<name> -p tag:=<label> [-p laps:=N]   # on its own
+```
+
+Where the car is: sim ground truth (`/ground_truth/odom` through `map_to_world.yaml`, which save_map writes when
+mapping in the sim), or `pose_topic` with the `/odom` speed without that file or with `pose_source:=localized`
+(the real car).
+
+| `laps.csv` column | |
+|---|---|
+| `lap_time_s`, `sim_lap_time_s` | crossing to crossing (interpolated between poses); the sim's own last lap (its timing line may sit elsewhere) |
+| `valid`, `collisions` | 1 unless the lap was interrupted or had a collision; the sim's `collision_count` over the lap (-1 unknown) |
+| `lat_rms_m`, `lat_max_m` | distance from the raceline |
+| `clearance_min_m` | smallest distance from the car's footprint (`footprint_front` 0.42 / `footprint_rear` 0.08 m of base_link, `footprint_width` 0.27 m) to a mapped wall; <= 0: touching |
+| `speed_mean_mps`, `speed_max_mps`, `speed_err_rms_mps` | speed, and speed minus the `/drive` speed (what the speed loop does not follow) |
+| `loc_rms_m`, `loc_max_m`, `loc_yaw_rms_deg` | `pose_topic` against ground truth at the same stamps (sim only) |
+
+`laps_sectors.csv`: `time_s`, `lat_max_m`, `clearance_min_m`, `speed_mean_mps` per lap and sector (`sectors`,
+default 10 equal lengths of the raceline from s = 0).
+
+## Speed per sector
+
+`tune_sectors` turns the laps into a speed scale per sector (`tracks/<name>/sectors.yaml`), one step per run:
+a sector that came within `--floor` (0.05 m) of a wall, or where a lap with a collision came closest, loses
+`--down` (0.05); one that stayed beyond `--target` (0.12 m) gains `--step` (0.03), within [`--min`, `--max`]
+(0.7, 1.3). Pure pursuit with `sector_speeds:=true` multiplies its profile by them, kept within the raceline's
+own acceleration and braking where they change. It refuses a run older than sectors.yaml (driven with other
+scales) and a sectors.yaml made for another raceline.
+
+```bash
+scripts/benchmark.sh <name> --tag s0 speed_scale:=1.0                       # no sectors.yaml yet: every scale 1.0
+ros2 run control tune_sectors <name>                                        # writes tracks/<name>/sectors.yaml
+scripts/benchmark.sh <name> --tag s1 speed_scale:=1.0 sector_speeds:=true
+ros2 run control tune_sectors <name>                                        # ... until it changes nothing
+```
+
+## Vehicle identification
+
+`sysid_recorder_node` records during any driving (wall follower laps, races, teleop: no special manoeuvre) and
+`fit_vehicle` turns the recording into settings:
+
+```bash
+ros2 run control sysid_recorder_node --ros-args --params-file $(ros2 pkg prefix control)/share/control/config/vehicle.yaml
+#   on the car: -p source:=odom (default ground_truth, the sim), and -p drive_topic:=/teleop when driving by
+#   joystick; Ctrl-C prints the file
+ros2 run control fit_vehicle ~/ws/log/sysid_<date>_<time>.csv    # [--racecar <racecar_car.ini>] on the car
+```
+
+- the steering gain g = measured path curvature / (tan(steering) / wheelbase), per speed band, from samples with
+  the steering held: on the steering the sim applied it is the sim adapter's `steering_gain`
+  (`autodrive_launch.py steering_gain:=g`); on the car, divide the VESC's `steering_angle_to_servo_gain` by the
+  gain on the `/drive` command. The repo's notes suggest g ~ 1.8 in the sim (`wheel_odom.py`): on the kinematic
+  car of `test_closed_loop.py`, a 1.8x car tracks 3x worse until calibrated.
+- the delay from a `/drive` steering command to the path following it: pure pursuit's `latency`
+- sim only: the throttle per m/s^2 beyond the speed feedforward: the adapter's `speed_ka` / `speed_ka_brake`
+- the accelerations reached, next to racecar.ini's planning limits
+
+## Emergency brake
+
+`safety_node` brakes when lidar returns lie in the car's path within stopping distance, whatever the controller
+and the localization think: the path is the arc of the `/drive` steering (the `/odom` yaw rate without a recent
+one), `half_width` + `margin` (0.135 + 0.05 m) either side, from the front bumper (`front` 0.42 m ahead of
+base_link) to speed x `reaction` (0.1 s) + speed^2 / (2 `decel` (4 m/s^2)) + `margin_ahead` (0.15 m) ahead;
+`min_points` (2) returns needed. It publishes a stop (the commanded steering, speed 0) on `/safety/drive` per scan
+until `hold` (0.5 s) after the path was last clear, and `/safety/active`. The sim adapter takes `/safety/drive`
+before `/drive` (`safety_timeout` 0.2 s); on the car it is an input of f1tenth_system's `ackermann_mux` above
+navigation and below the joystick (`config/car_mux.yaml`). A wall the arc turns away from is not in the way; one
+straight ahead at the turn-in of a corner can be, at speed: tune `decel` and `reaction` on the car at low speed
+first. Off in `race.launch.py` (`safety:=true`), on in `car.launch.py`.
+
+## Real car
+
+The stack has not run on the car yet. f1tenth_system brings up the lidar, VESC and joystick; `car.launch.py` adds:
+
+```bash
+ros2 launch f1tenth_stack bringup_launch.py
+ros2 launch control car.launch.py [imu_roll:=0.0] [imu_pitch:=0.0] [imu_yaw:=0.0] [safety:=true]
+scripts/record.sh <label>     # a rosbag of the run: ws/bags/<label>_<date>_<time>
+```
+
+- TF `base_link -> imu`: zero translation (Cartographer needs the IMU at base_link) and the VESC's mounting rotation
+- `perception imu_odom_node`: `/odom` and TF `odom -> base_link` from the wheel speed and the IMU's gyro: f1tenth_system's
+  `vesc_to_odom` takes the yaw from the steering model, which read ~55 % of the yaw rate in the sim. It learns the
+  gyro's bias while the car stands still.
+- `safety_node`, the emergency brake
+
+Once, in f1tenth_system: `vesc_to_odom` with `publish_tf: false` and its `odom` remapped to `/odom/wheel`, and the
+`safety` input of `config/car_mux.yaml` in its `mux.yaml`. Calibrate the VESC (`speed_to_erpm_gain`,
+`steering_angle_to_servo_gain` / `offset`), check the IMU's units (`imu_odom_node` `gyro_scale`: a full turn by hand
+must bring the yaw back), and measure the car into `config/vehicle_car.yaml` (wheelbase, steering lock: now
+f1tenth_gym's defaults), planning's `config/racecar_car.ini` and the brake's body in `car.launch.py`. Map with
+`map_track.sh <name>` driving by joystick (its followers load the sim's `vehicle.yaml`), re-plan with
+`build_raceline <name> --config .../racecar_car.ini` (`map_track.sh` plans with `racecar.ini`), and race with
+`vehicle:=<that vehicle_car.yaml>`, a low `max_speed` and `speed_scale` first. `lap_logger_node` on the car:
+`pose_source:=localized` (no `map_to_world.yaml`) and the car's `footprint_*`. `perception mcl_node`
+deskews the swept Hokuyo scans with the odometry (`deskew`, on): at 9.6 m/s with a 25 ms sweep its error fell from
+0.125 to 0.038 m in `test_deskew.py`; the obstacle spliner does the same.
 
 ## Wall follower
 
@@ -222,6 +375,7 @@ python3 -m pytest ws/src/control/test   # needs a sourced ROS 2 environment and 
 
 The tests publish `/scan`, `/tracked_pose`, `/localized_pose` and read `/drive`: with the bridge running, give them their
 own `ROS_DOMAIN_ID` (e.g. `ROS_DOMAIN_ID=42 python3 -m pytest ...`) so they don't drive the sim car.
+`test_closed_loop.py` drives pure pursuit against `test/sim_car.py` in real time (~1.5 min).
 
 ## Credit
 

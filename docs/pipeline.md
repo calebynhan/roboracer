@@ -22,6 +22,11 @@ ros2 run autodrive_bridge teleop_keyboard           # shell 3: drive the mapping
 scripts/race.sh <name> [speed_scale:=0.5]           # localization + pure pursuit                  race
 scripts/race.sh <name> avoid:=true                  #   ... passing obstacles the map did not have
 ros2 launch control follow_the_gap.launch.py [speed:=1.0]   # no-map fallback, instead of race.sh   ftg
+scripts/benchmark.sh <name> --laps 5 --tag <label> [race args]   # N flying laps logged (control lap_logger_node), compared
+ros2 run control tune_sectors <name>                # speed per sector from the laps -> race ... sector_speeds:=true
+ros2 run control sysid_recorder_node --ros-args --params-file <vehicle.yaml>   # record any driving, then
+ros2 run control fit_vehicle <recording.csv>        #   steering gain, delay, throttle feedforward, accelerations seen
+scripts/record.sh <label>                           # a rosbag of the run (ws/bags/)
 ```
 
 Restart the bridge with Ctrl-C in shell 1 (SIGINT to the whole process group; or `kill -INT -- -<pgid>`),
@@ -73,9 +78,9 @@ Check with `ros2 node list` and kill leftovers before the next launch.
 | Package | Contents |
 |---|---|
 | `autodrive_bridge` | `fast_bridge`, `adapter`, `wheel_odom`, `teleop_keyboard`; `autodrive_launch.py`. Sim only: replaced by f1tenth_system on the car. |
-| `perception` | Cartographer configs, `mapping.launch.py`, `localization.launch.py`, `save_map`, `map_origin`. Particle filter localization instead of Cartographer's: `mcl.launch.py` (`mcl_node`, `mcl.py`, `config/mcl.yaml`). Experimental, not in the pipeline: `ekf.launch.py` (robot_localization IMU EKF + `corrector`, a drift-corrected forward speed on `/odometry/corrected`, sim only) |
+| `perception` | Cartographer configs, `mapping.launch.py`, `localization.launch.py`, `save_map`, `map_origin`. Particle filter localization instead of Cartographer's: `mcl.launch.py` (`mcl_node`, `mcl.py`, `config/mcl.yaml`). It deskews scans a real lidar sweeps (`deskew.py`). Real car: `imu_odom_node`, `/odom` from the wheel speed and the gyro (`control car.launch.py`). Experimental, not in the pipeline: `ekf.launch.py` (robot_localization IMU EKF + `corrector`, a drift-corrected forward speed on `/odometry/corrected`, sim only) |
 | `planning` | `build_raceline` = `centerline` extraction + TUM `mintime` optimization. `obstacle_spliner_node`: stationary-obstacle avoidance, `/local_path` (`race.launch.py avoid:=true`) |
-| `control` | `pure_pursuit_node`, `pure_pursuit.launch.py`, `race.launch.py`. `follow_the_gap_node` (`follow_the_gap.launch.py`): reactive `/scan` -> `/drive`, needs no map, the fallback. `wall_follow_node` (`wall_follow.launch.py`): drives the mapping laps (`map_track.sh --wall-follow`), the default. `disparity_gap_node` (`disparity_gap.launch.py`): follow the gap with disparity extension, also drives the mapping laps (`map_track.sh --gap-follow`, experimental: see control/README.md) |
+| `control` | `pure_pursuit_node`, `pure_pursuit.launch.py`, `race.launch.py`. Measuring and tuning: `lap_logger_node` + `lap_summary` (`scripts/benchmark.sh`), `tune_sectors`, `sysid_recorder_node` + `fit_vehicle`. `safety_node`: emergency brake on `/scan` (`race.launch.py safety:=true`). `car.launch.py`: the real car's additions to f1tenth_system (IMU transform, `perception imu_odom_node`, `safety_node`). `follow_the_gap_node` (`follow_the_gap.launch.py`): reactive `/scan` -> `/drive`, needs no map, the fallback. `wall_follow_node` (`wall_follow.launch.py`): drives the mapping laps (`map_track.sh --wall-follow`), the default. `disparity_gap_node` (`disparity_gap.launch.py`): follow the gap with disparity extension, also drives the mapping laps (`map_track.sh --gap-follow`, experimental: see control/README.md) |
 
 ## Interfaces
 
@@ -90,6 +95,9 @@ Check with `ros2 node list` and kill leftovers before the next launch.
 | `/localized_pose` | `geometry_msgs/PoseStamped`, frame `map` | localization_gate (or `mcl_node`): `/tracked_pose` (or the filter pose) relayed once localized; withheld after a sim reset (`sim_reset`) until relocalized (`mcl_node`: also while it searches for the car when lost) (pure pursuit's default `pose_topic`; with none for `max_pose_age` s it stops the car) |
 | `/autodrive/roboracer_1/sim_reset` | `std_msgs/String`, the reason | fast_bridge (sim only): one event per sim reset. Reset commands always; respawns and other teleports (collision count change, position jump) only with restricted topics. fast_bridge also replies zeros for `reset_frames` frames |
 | `/local_path` | `nav_msgs/Path`, frame `map`, one pose per raceline point | obstacle_spliner_node: the raceline, shifted around the nearest obstacle in the way; pure_pursuit follows it with `avoid:=true` |
+| `/safety/drive` | `ackermann_msgs/AckermannDriveStamped` | safety_node: a stop when the path is blocked within stopping distance; overrides `/drive` (sim: the adapter, `safety_timeout`; car: `ackermann_mux`, `control/config/car_mux.yaml`) |
+| `/safety/active` | `std_msgs/Bool` | safety_node: braking or not, per scan |
+| `/odom/wheel` | `nav_msgs/Odometry` | car only: f1tenth_system's vesc_to_odom (remapped, `publish_tf` false); `imu_odom_node` makes `/odom` from it and the gyro |
 | `/local_path/valid` | `std_msgs/Bool` | obstacle_spliner_node: false when its pose or scan is stale (or no pose covers a scan's stamp for `max_scan_age`) or no side is collision-free (pure_pursuit then stops) |
 | `/ground_truth/pose`, TF `world -> ground_truth` | `geometry_msgs/PoseStamped`, frame `world` (sim) | adapter, debugging only |
 
@@ -109,6 +117,8 @@ mounting rotation, or Cartographer stops waiting for an IMU it cannot transform.
 | `centerline.csv` | `build_raceline` | TUM input: `# x_m,y_m,w_tr_right_m,w_tr_left_m`, closed loop, driving direction |
 | `raceline.csv` | `build_raceline` | TUM output: `# s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2`, `map` frame. Second header line `# raceline: {json}`: method (`mintime`, `mintime-retry`, `centerline`), `clean`, settings `changed`, `notes` (failures, clearance), solver, lap, min wall clearance, build time |
 | `preview.png` | `build_raceline` | map, centerline, track bounds, raceline coloured by speed |
+| `laps.csv`, `laps_sectors.csv` | `control lap_logger_node` | one row per flying lap / per lap and sector, a `# run ... tag=...` line per run (control/README.md, Lap benchmark) |
+| `sectors.yaml` | `control tune_sectors` | `length_m` (the raceline's), `scales` (one per equal sector from s = 0): pure pursuit `sector_speeds:=true` |
 
 ## Car parameters (AutoDRIVE RoboRacer)
 
@@ -117,4 +127,8 @@ mounting rotation, or Cartographer stops waiting for an IMU it cannot transform.
 | wheelbase, max steering | `ws/src/control/config/vehicle.yaml` (0.33 m, 0.524 rad), loaded by every node that uses them |
 | wheel radius | 0.0585 m (calibrated against ground truth) |
 | throttle | motor torque (sim VehicleController; ~25 m/s per unit throttle is only its steady state), speed loop in `adapter.yaml` |
-| acceleration limit | 2.5 m/s^2 up, 6.9 m/s^2 down (`adapter.yaml` `max_acceleration`, `max_deceleration`): the adapter ramps the /drive speed as the car's speed controller would, so a launch from a standstill does not spin the wheels; after a /drive gap the ramp restarts from the measured speed |
+| acceleration limit | 2.5 m/s^2 up, 6.9 m/s^2 down (`adapter.yaml` `max_acceleration`, `max_deceleration`): the adapter ramps the /drive speed as the car's speed controller would, so a launch from a standstill does not spin the wheels; after a /drive gap the ramp restarts from the measured speed. racecar.ini's `ax_pos_safe` must equal `max_acceleration` (test_vehicle_params.py) |
+| steering gain | `adapter.yaml` `steering_gain` (1.0): measured / bicycle-model path curvature, `control fit_vehicle` measures it; the adapter commands atan(tan(angle) / gain). The repo's notes suggest ~1.8 |
+| throttle feedforward | `adapter.yaml` `speed_ka`, `speed_ka_brake` (0): throttle per m/s^2, `fit_vehicle` fits them (with pure pursuit `accel_feedforward:=true`) |
+| overrides | `autodrive_launch.py steering_gain:= speed_ka:= speed_ka_brake:= max_acceleration:= max_deceleration:=` for one run; `build_raceline --set mue=0.85 ...` for one raceline |
+| real car | `control/config/vehicle_car.yaml`, `planning/config/racecar_car.ini`: f1tenth_gym's defaults, to measure (control/README.md, Real car) |

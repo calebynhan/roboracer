@@ -28,6 +28,12 @@ alias map-track="~/ws/scripts/map_track.sh"
 # Race a mapped track: race <name> [speed_scale:=0.5]
 alias race="~/ws/scripts/race.sh"
 
+# Race N flying laps and log each one: bench <name> --laps 5 --tag <label> [race args] (control/README.md)
+alias bench="~/ws/scripts/benchmark.sh"
+
+# Record a rosbag of the run: record-bag <label>
+alias record-bag="~/ws/scripts/record.sh"
+
 # No-map fallback: follow the gap on /scan, no map or localization: ftg [speed:=1.0]
 # (stop it before race: both publish /drive)
 alias ftg="ros2 launch control follow_the_gap.launch.py"

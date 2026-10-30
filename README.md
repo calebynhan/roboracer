@@ -36,7 +36,9 @@ new track ─► Cartographer mapping ─► centerline ─► TUM minimum-time 
 | **Localization** | `perception` | Cartographer pure localization on the saved map. `localization_gate` lets the car drive only once Cartographer has localized, and relocalizes it after every sim reset. Alternative: a Monte Carlo localization particle filter (`mcl_node`, `localizer:=mcl`) on the saved `map.yaml` that finds the car by itself (global scan matching) and re-anchors after odometry jumps. |
 | **Planning** | `planning` | Centerline and track widths extracted from the occupancy grid, checked against the mapping lap; [TUM global race trajectory optimization](https://github.com/TUMFTM/global_racetrajectory_optimization) (`mintime`) with a RoboRacer vehicle model; if it fails, a loudly reported fallback line (mintime without the acceleration limits, then the centerline; exit status 2, recorded in `raceline.csv`'s header); a preview image of the result. Stationary-obstacle avoidance (`obstacle_spliner_node`): the raceline shifted sideways around obstacles the map did not have. |
 | **Control** | `control` | Pure pursuit on the raceline with a speed-dependent lookahead and safety stops on bad poses. With `avoid:=true`, it follows the obstacle-avoiding path instead, and stops when there is no collision-free one. Follow the gap as a no-map fallback. A centring wall follower (the default) and an experimental follow the gap with disparity extension, either of which drives the mapping laps by itself. |
-| **Tooling** | `ws/scripts` | `map_track.sh` (map → save → centerline → raceline in one command) and `race.sh`; shell aliases; Foxglove bridge; 132 unit and integration tests. |
+| **Measuring and tuning** | `control` | `lap_logger_node` / `benchmark.sh`: every flying lap's time, collisions, distance from the raceline, wall clearance, speed and localization error, per lap and sector. `tune_sectors`: speed per sector from those laps. `sysid_recorder_node` / `fit_vehicle`: the steering gain, the actuation delay, the throttle feedforward and the accelerations reached, from any driving. |
+| **Real car** | `control`, `perception` | `car.launch.py` on top of f1tenth_system: IMU transform, odometry with the gyro's yaw (`imu_odom_node`), emergency brake on the lidar (`safety_node`, also `race.launch.py safety:=true`); scan deskew in the particle filter and the obstacle spliner; the car's `vehicle_car.yaml` / `racecar_car.ini` (to measure). Not run on the car yet. |
+| **Tooling** | `ws/scripts` | `map_track.sh` (map → save → centerline → raceline in one command), `race.sh`, `benchmark.sh`, `record.sh` (rosbag); shell aliases; Foxglove bridge; unit, integration and closed-loop tests. |
 
 ## Repository layout
 
@@ -47,7 +49,7 @@ ws/src/autodrive_bridge/         AutoDRIVE <-> ROS 2 bridge, VESC stand-in, whee
 ws/src/perception/               Cartographer configs and launches, save_map, localization_gate
 ws/src/planning/                 centerline extraction, TUM minimum-time raceline, racecar.ini, obstacle spliner
 ws/src/control/                  pure pursuit, follow the gap, wall follower, disparity gap follower, vehicle.yaml, race.launch.py
-ws/scripts/                      map_track.sh, race.sh, common.sh
+ws/scripts/                      map_track.sh, race.sh, benchmark.sh, record.sh, common.sh
 ws/tracks/<name>/                generated per track (git-ignored)
 docs/pipeline.md                 interfaces, frames, track file formats and car parameters
 ```
@@ -105,6 +107,7 @@ scripts/map_track.sh <name> --wall-follow    # map the track: the wall follower 
                                              # (--gap-follow: follow the gap drives them; experimental, see ws/src/control/README.md)
 scripts/race.sh <name> speed_scale:=0.5      # reset the car, localize on the saved map, pure pursuit on the raceline
 scripts/race.sh <name> avoid:=true           #   ... and pass obstacles the map did not have
+scripts/benchmark.sh <name> --laps 5 --tag baseline speed_scale:=1.0   # race N flying laps and log each one
 ```
 
 To drive the mapping laps by hand instead, run `scripts/map_track.sh <name>`, drive 1-2 clean laps with

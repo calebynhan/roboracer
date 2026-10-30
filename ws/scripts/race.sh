@@ -4,6 +4,10 @@
 #   ws/scripts/race.sh <name> [speed_scale:=0.5] [max_speed:=0.0] [pose_topic:=/localized_pose] [avoid:=false]
 #                          [localizer:=mcl]    particle filter on map.yaml instead of Cartographer localization
 #                          [adaptive_lookahead:=true]   lookahead capped by the raceline's curvature (default; :=false = speed term only)
+#                          [latency:=0.0] [speed_preview_time:=-1.0] [accel_feedforward:=false] [sector_speeds:=false]
+#                          [avoid_max_lateral_accel:=0.0]   pure pursuit options, off by default (control/README.md)
+#                          [safety:=false]   the emergency brake (control safety_node)
+#                          [vehicle:=<vehicle.yaml>]   the car's geometry (the real car: config/vehicle_car.yaml)
 #
 # Needs the bridge running and tracks/<name>/ from ws/scripts/map_track.sh <name>.
 # Resets the sim car first: localization starts from the pose mapping started from. The car waits
