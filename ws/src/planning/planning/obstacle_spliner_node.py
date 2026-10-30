@@ -35,6 +35,10 @@ pure_pursuit_node with avoid:=true steers on it) and /local_path/valid (std_msgs
 pose or scan is stale or neither side is collision-free (the path is then the raceline). A tick whose
 scans are all newer than the pose stream publishes nothing (the last path stands, for max_pose_wait s).
 
+deskew (default on): a real lidar sweeps its beams over the scan (time_increment > 0, the Hokuyo: 25 ms, 0.18 m
+at 7 m/s), so each beam is placed with the pose at its own time (beam i: the stamp + time_increment x i,
+interpolated in the pose stream, held past its newest pose). The sim's scans are instantaneous: nothing changes.
+
 Needs raceline_path (raceline.csv), map_yaml (map.yaml + its image), /scan, pose_topic (map frame), TF
 map -> odom_frame (MCL and Cartographer broadcast it; without it each scan is aligned on its own) and
 TF base_frame -> the scan's frame (the lidar sits 0.27 m ahead of base_link on the RoboRacer: placed at
@@ -134,6 +138,7 @@ class ObstacleSpliner(Node):
         # scan alone) walls come back as obstacles: 8 and 3 stops a lap
         self.max_align_shift = float(p('max_align_shift', 0.3).value)
         self.max_align_turn = math.radians(float(p('max_align_turn', 6.0).value))
+        self.deskew = bool(p('deskew', True).value)
         rate = float(p('rate_hz', 15.0).value)
         if not raceline_path or not map_yaml:
             raise ValueError('Set the raceline_path and map_yaml parameters')
@@ -292,6 +297,17 @@ class ObstacleSpliner(Node):
         turn = math.atan2(math.sin(a1 - a0), math.cos(a1 - a0))
         return x0 + u * (x1 - x0), y0 + u * (y1 - y0), a0 + u * turn
 
+    def beam_poses(self, scan, n):
+        """(x, y, yaw) arrays of base_frame in the map when each of the scan's n beams was taken (the stamp +
+        time_increment x i), interpolated in the pose stream and held past either end of it; None without poses."""
+        if len(self.poses) < 2:
+            return None
+        stamps = np.array([q[0] for q in self.poses])
+        poses = np.array([q[1:] for q in self.poses])
+        t = seconds(scan.header.stamp) + np.arange(n) * scan.time_increment
+        return (np.interp(t, stamps, poses[:, 0]), np.interp(t, stamps, poses[:, 1]),
+                np.interp(t, stamps, np.unwrap(poses[:, 2])))
+
     def wall_points(self, points):
         """The points within ALIGN_BAND of a mapped wall: those the alignment fits."""
         r = map_coordinates(self.wall_dist, self.map.to_pixel(points).T, order=1, mode='nearest')
@@ -420,18 +436,30 @@ class ObstacleSpliner(Node):
         c, s = math.cos(yaw), math.sin(yaw)
         r = np.where(good, r, 0.0)   # no inf / nan in the points: only good returns are used
         local = np.column_stack((r * np.cos(angles), r * np.sin(angles))) + [lidar_x, lidar_y]
-        points = local @ np.array([[c, s], [-s, c]]) + [x, y]
+        beams = self.beam_poses(scan, len(r)) if self.deskew and scan.time_increment > 0 else None
+        if beams is None:
+            points = local @ np.array([[c, s], [-s, c]]) + [x, y]
+        else:   # each beam from where the car was when it was taken
+            bx, by, byaw = beams
+            cb, sb = np.cos(byaw), np.sin(byaw)
+            points = np.column_stack((bx + cb * local[:, 0] - sb * local[:, 1],
+                                      by + sb * local[:, 0] + cb * local[:, 1]))
         if np.any(good):
             lidar = np.array([x, y]) + np.array([[c, -s], [s, c]]) @ [lidar_x, lidar_y]
             stamp, centre = seconds(scan.header.stamp), np.array([x, y])
             frame = self.map_odom(stamp)
             last = self.recent_correction(stamp, frame, centre)
+            if beams is None:
+                bearing, rng = angles + yaw, r
+            else:   # the deskewed points as seen from the lidar at the stamp, for the map's rays from there
+                rel = points - lidar
+                bearing, rng = np.arctan2(rel[:, 1], rel[:, 0]), np.where(good, np.hypot(rel[:, 0], rel[:, 1]), 0.0)
             if last is None:
-                shadow = self.shadowed(lidar, angles + yaw, r, good)
+                shadow = self.shadowed(lidar, bearing, rng, good)
             else:   # the map's rays from where the last correction puts the lidar: a tighter test
                 (cx, cy, ct), cc, sc = last[1], math.cos(last[1][2]), math.sin(last[1][2])
                 origin = np.array([x + cx, y + cy]) + np.array([[cc, -sc], [sc, cc]]) @ (lidar - [x, y])
-                shadow = self.shadowed(origin, angles + yaw + ct, r, good, ALIGN_SHADOW_ALIGNED)
+                shadow = self.shadowed(origin, bearing + ct, rng, good, ALIGN_SHADOW_ALIGNED)
             fit = good & ~shadow
             pts = points[fit]
             dx, dy, dyaw = self.gate(self.align(pts, centre), stamp, lambda seed: self.align(pts, centre, seed),

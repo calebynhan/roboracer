@@ -51,6 +51,9 @@ Extra: /mcl/particles (PoseArray), /map (OccupancyGrid, latched) for Foxglove.
   sim reset: fast_bridge's /autodrive/roboracer_1/sim_reset event: the pose is withheld at once; after
              debounce s with the car still, a global search.
   manual:    a PoseWithCovarianceStamped on /initialpose (RViz, Foxglove) restarts the cloud there.
+  deskew:    a real lidar sweeps its beams over the scan period (time_increment > 0): each beam is moved, with the
+             odometry, to where the car was at the scan's stamp (perception/deskew.py). The sim's scans are
+             instantaneous (time_increment 0): nothing changes.
 """
 import math
 import os
@@ -70,6 +73,7 @@ from sensor_msgs.msg import LaserScan
 from std_msgs.msg import String
 from tf2_ros import Buffer, TransformBroadcaster, TransformException, TransformListener
 
+from perception.deskew import deskew, interpolate_poses, relative_poses
 from perception.map_origin import pose2d
 from perception.mcl import (Alternatives, LikelihoodMap, ParticleFilter, ScanMatcher, choose_pose, compose,
                             inverse, pose_distance, relative, select_beams, wrap)
@@ -171,6 +175,7 @@ class MclNode(Node):
         self.prev_odom = None         # the previous /odom message: (pose, stamp [s], speed), for frame jumps
         self.odom_hist = deque(maxlen=200)   # (stamp [s], pose) of recent /odom: the odometry at a scan's stamp
         self.interpolate_odom = p('interpolate_odom', True).value
+        self.deskew = p('deskew', True).value   # scans swept over time_increment x beams: each beam where seen from
         self.scan_odom = None         # the odometry at the scan being processed
         self.latency = []             # s, newest /odom stamp minus scan stamp, since the last latency log
         self.latency_log_t = time.monotonic()
@@ -380,6 +385,8 @@ class MclNode(Node):
                                       max(msg.range_min, 0.05), msg.range_max)
         if len(ranges) < MIN_BEAMS:
             return
+        if self.deskew and msg.time_increment > 0.0:
+            ranges, angles = self.deskew_beams(ranges, angles, msg, sensor)
         self.scan_odom = self.odom_at(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
         self.log_latency(msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9)
         self.poll_search()
@@ -422,6 +429,24 @@ class MclNode(Node):
         self.updates += 1
         if self.publish_particles and self.updates % 5 == 0:
             self.publish_cloud(msg.header.stamp)
+
+    def deskew_beams(self, ranges, angles, msg, sensor):
+        """The beams as seen from where the car was at the scan's stamp (beam i is time_increment x i later), by
+        the odometry over the scan (interpolated; past the newest /odom it is held, so only the part of the sweep
+        it covers moves). Unchanged without odometry history around the stamp, or for a scan stamped more than
+        MAX_SCAN_LATENCY before the newest /odom."""
+        hist = self.odom_hist
+        stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        # as odom_at: a scan stamped long before the newest /odom (a lidar on another clock) is not matched to the
+        # odometry of that time, so it is not bent by it either
+        if len(hist) < 2 or stamp < hist[0][0] or hist[-1][0] - stamp > MAX_SCAN_LATENCY:
+            return ranges, angles
+        stamps = np.array([h[0] for h in hist])
+        poses = np.array([h[1] for h in hist])
+        idx = np.round((np.asarray(angles) - msg.angle_min) / msg.angle_increment)
+        ref = [float(v) for v in interpolate_poses(stamps, poses, stamp)]
+        beams = interpolate_poses(stamps, poses, stamp + idx * msg.time_increment)
+        return deskew(ranges, angles, relative_poses(ref, *beams), sensor)
 
     def log_latency(self, stamp):
         """Every LATENCY_LOG_PERIOD s: how much older the scans are than the newest /odom (what odom_at makes up

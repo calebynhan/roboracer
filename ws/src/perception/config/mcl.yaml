@@ -57,6 +57,8 @@ mcl:
     relocate_margin: 0.05      # ... and fitting this much better than the scan fits at the filter's pose (also the
                                #   verify behind a start: it moves a driving car only past both gates)
     interpolate_odom: true     # the odometry at each scan's stamp (interpolated), not the newest: lidar latency
+    deskew: true               # a lidar sweeping its beams (time_increment > 0, the real car): each beam moved by the
+                               #   odometry to where the car was at the stamp; the sim's scans are instantaneous
     # The absolute values are from the sim (iros2026_v2: true pose 0.93-1.0 on good stretches, <= 0.74 on its
     # badly mapped one, a look-alike there 0.84). A real lidar may fit less everywhere: the ratios then lower the
     # gates with the good-fit level. To check on a real bag: the re-anchor log lines print 'fit a -> b'; good
