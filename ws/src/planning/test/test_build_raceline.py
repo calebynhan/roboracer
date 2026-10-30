@@ -92,6 +92,75 @@ def test_fallback_reported(tmp_path, capsys):
     assert (d / 'preview.png').is_file()
 
 
+FAKE_MINTIME = """#!/usr/bin/env python3
+# stand-in for the TUM venv python: argv = -I tum_mintime.py <centerline.csv> <racecar.ini> <out.csv> <work_dir>.
+# Records the ini's optim_opts_mintime and veh_params next to out (seen.json) and writes the centerline as the
+# "optimized" line at 3 m/s.
+import configparser, json, os, sys
+import numpy as np
+centerline, ini, out = sys.argv[3:6]
+cfg = configparser.ConfigParser()
+cfg.read(ini)
+seen = {k: json.loads(cfg.get(sec, k)) for sec, k in (('OPTIMIZATION_OPTIONS', 'optim_opts_mintime'),
+                                                      ('GENERAL_OPTIONS', 'veh_params'))}
+json.dump(seen, open(os.environ['FAKE_SEEN'], 'w'))
+xy = np.loadtxt(centerline, delimiter=',', comments='#')[:, :2]
+xy = np.vstack([xy, xy[:1]])
+s = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(xy, axis=0).T))])
+traj = np.column_stack([s, xy, np.zeros(len(s)), np.zeros(len(s)), np.full(len(s), 3.0), np.zeros(len(s))])
+np.savetxt(out, traj, delimiter=';', header='s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2')
+print('EXIT: Optimal Solution Found.')
+"""
+
+
+def fake_mintime(tmp_path, monkeypatch):
+    fake = tmp_path / 'fake_python'
+    fake.write_text(FAKE_MINTIME)
+    fake.chmod(0o755)
+    seen = tmp_path / 'seen.json'
+    monkeypatch.setenv('FAKE_SEEN', str(seen))
+    return fake, seen
+
+
+def test_overrides_reach_the_optimizer_and_the_provenance(tmp_path, monkeypatch):
+    import json
+    fake, seen = fake_mintime(tmp_path, monkeypatch)
+    d = fixture_track(tmp_path)
+    build_raceline.main(['fixture', '--tracks-dir', str(tmp_path), '--config', CONFIG, '--tum-python', str(fake),
+                         '--set', 'mue=0.85', '--set', 'ax_neg_safe=-5.0', '--set', 'v_max=12'])   # exit 0
+    opts = json.loads(seen.read_text())
+    assert opts['optim_opts_mintime']['mue'] == 0.85 and opts['optim_opts_mintime']['ax_neg_safe'] == -5.0
+    assert opts['veh_params']['v_max'] == 12 and 'v_max' not in opts['optim_opts_mintime']
+    assert opts['optim_opts_mintime']['width_opt'] == 0.5   # the rest as racecar.ini has it
+    prov = read_provenance(d / 'raceline.csv')
+    assert prov['method'] == 'mintime' and prov['clean'] and prov['notes'] == []
+    assert prov['overrides'] == {'mue': 0.85, 'ax_neg_safe': -5.0, 'v_max': 12}
+
+
+def test_overrides_bound_the_fallback_speeds(tmp_path):
+    # every TUM run fails: the centerline's speed profile uses the overridden limits
+    fake = tmp_path / 'python'
+    fake.write_text('#!/bin/sh\necho "EXIT: Maximum Number of Iterations Exceeded."\nexit 1\n')
+    fake.chmod(0o755)
+    d = fixture_track(tmp_path)
+    with pytest.raises(SystemExit):
+        build_raceline.main(['fixture', '--tracks-dir', str(tmp_path), '--config', CONFIG, '--tum-python', str(fake),
+                             '--set', 'ax_pos_safe=1.0', '--set', 'ay_safe=3.0'])
+    rl = read_raceline(d / 'raceline.csv')
+    assert rl[:, 6].max() <= 1.0 + 1e-9
+    assert np.max(rl[:, 5] ** 2 * np.abs(rl[:, 4])) <= 3.0 + 1e-6
+    assert read_provenance(d / 'raceline.csv')['overrides'] == {'ax_pos_safe': 1.0, 'ay_safe': 3.0}
+
+
+@pytest.mark.parametrize('item, why', [('no_such_option=1', 'not an optim_opts_mintime or veh_params entry'),
+                                       ('mue', 'expected KEY=VALUE'), ('mue=fast', 'VALUE must be JSON')])
+def test_bad_override(tmp_path, capsys, item, why):
+    fixture_track(tmp_path)
+    with pytest.raises(SystemExit) as e:
+        build_raceline.main(['fixture', '--tracks-dir', str(tmp_path), '--config', CONFIG, '--set', item])
+    assert why in str(e.value.code)
+
+
 def test_unknown_provenance(tmp_path):
     # a hand-written stand-in (as tracks/iros2026_v2 had) or a raceline from before provenance was recorded
     p = tmp_path / 'raceline.csv'

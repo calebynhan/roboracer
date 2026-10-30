@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""ros2 run planning build_raceline <name>
+"""ros2 run planning build_raceline <name> [--set KEY=VALUE ...]
 
 Reads   <tracks>/<name>/map.pgm, map.yaml, trajectory.csv (optional: driving direction + start)
 Writes  <tracks>/<name>/centerline.csv, raceline.csv, preview.png   (formats: docs/pipeline.md)
@@ -14,6 +14,11 @@ Anything but a clean mintime line (a fallback, or a line closer to a wall than h
 ends in a WARNING block. raceline.csv's second header line records how it was made
 (# raceline: {"method": ..., "clean": ..., "notes": [...], ...}); pure_pursuit_node logs it.
 
+--set KEY=VALUE (repeatable): racecar.ini's optim_opts_mintime or veh_params entry KEY set to VALUE (JSON, e.g.
+mue=0.85, ax_neg_safe=-5.0, width_opt=0.45) for this build, without editing the file; recorded in the provenance
+line ("overrides"). A converged line with overrides is still a clean mintime line: they are a choice, not a
+fallback. To keep the line they replace, plan a copy of the track (cp -r tracks/<name> tracks/<name>_try).
+
 Exit status: 0 clean mintime line, 2 raceline written but NOT a clean mintime line, 1 no raceline.
 """
 import argparse
@@ -21,6 +26,7 @@ import configparser
 import datetime
 import json
 import os
+import shutil
 import sys
 import tempfile
 import time
@@ -44,16 +50,44 @@ def default_config():
                             'config', 'racecar.ini')
 
 
+# the racecar.ini entries --set may change: (section, option) of the JSON dicts they live in
+SETTABLE = (('OPTIMIZATION_OPTIONS', 'optim_opts_mintime'), ('GENERAL_OPTIONS', 'veh_params'))
+
+
 def ini_with(ini, changes, path):
-    """Writes a copy of ini with optim_opts_mintime entries replaced to path (comments are dropped)."""
+    """Writes a copy of ini to path with entries of optim_opts_mintime or veh_params (wherever each key is; a
+    new key goes to optim_opts_mintime) replaced (comments are dropped)."""
     cfg = configparser.ConfigParser()
     cfg.read(ini)
-    opts = json.loads(cfg.get('OPTIMIZATION_OPTIONS', 'optim_opts_mintime'))
-    opts.update(changes)
-    cfg.set('OPTIMIZATION_OPTIONS', 'optim_opts_mintime', json.dumps(opts))
+    dicts = {so: json.loads(cfg.get(*so)) for so in SETTABLE}
+    for key, value in changes.items():
+        where = next((so for so in SETTABLE if key in dicts[so]), SETTABLE[0])
+        dicts[where][key] = value
+    for so, d in dicts.items():
+        cfg.set(*so, json.dumps(d))
     with open(path, 'w') as f:
         cfg.write(f)
     return path
+
+
+def parse_overrides(items, ini):
+    """['key=value', ...] -> {key: JSON value}; every key must already be in optim_opts_mintime or veh_params."""
+    cfg = configparser.ConfigParser()
+    cfg.read(ini)
+    known = set().union(*(json.loads(cfg.get(*so)) for so in SETTABLE))
+    out = {}
+    for item in items:
+        key, sep, value = item.partition('=')
+        key = key.strip()
+        if not sep or not key:
+            raise ValueError(f'--set {item!r}: expected KEY=VALUE')
+        if key not in known:
+            raise ValueError(f'--set {key}: not an optim_opts_mintime or veh_params entry of {ini}')
+        try:
+            out[key] = json.loads(value)
+        except json.JSONDecodeError:
+            raise ValueError(f'--set {key}={value}: VALUE must be JSON (a number, true/false, null, ...)')
+    return out
 
 
 def reason(e):
@@ -73,8 +107,14 @@ def main(argv=None):
     ap.add_argument('--carve-trajectory', type=float, nargs='?', const=0.3, default=None, metavar='RADIUS',
                     help='treat cells within RADIUS m (default 0.3) of the mapping lap as free; only for '
                          'tracks whose map shows walls across the driven path (overpass)')
+    ap.add_argument('--set', action='append', default=[], metavar='KEY=VALUE',
+                    help="override a racecar.ini optim_opts_mintime / veh_params entry (JSON value), repeatable")
     ap.add_argument('--tum-python', default=TUM_PYTHON)
     args = ap.parse_args(argv)
+    try:
+        overrides = parse_overrides(args.set, args.config)
+    except ValueError as e:
+        sys.exit(f'build_raceline: {e}')
 
     d = os.path.join(args.tracks_dir, args.name)
     map_yaml = os.path.join(d, 'map.yaml')
@@ -104,8 +144,21 @@ def main(argv=None):
     print(f'      {len(track)} points, {seg.sum():.1f} m, width {width.min():.2f}-{width.max():.2f} m -> {cl_csv}')
 
     rl_csv = os.path.join(d, 'raceline.csv')
+    work = tempfile.mkdtemp(prefix='build_raceline_')
+    try:
+        return plan(args, d, track, m, mask, cl_csv, rl_csv, seg, width, overrides, work, t0)
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
+def plan(args, d, track, m, mask, cl_csv, rl_csv, seg, width, overrides, work, t0):
+    """Steps 2 and 3: the raceline (mintime, else its fallbacks) and the preview."""
+    config = args.config
+    if overrides:
+        config = ini_with(args.config, overrides, os.path.join(work, 'racecar_overrides.ini'))
+        print(f'      racecar.ini overrides: {json.dumps(overrides)}')
     cfg = configparser.ConfigParser()
-    cfg.read(args.config)
+    cfg.read(config)
     veh = json.loads(cfg.get('GENERAL_OPTIONS', 'veh_params'))
     opts = json.loads(cfg.get('OPTIMIZATION_OPTIONS', 'optim_opts_mintime'))
     width_veh, width_opt = veh['width'], opts['width_opt']
@@ -125,16 +178,15 @@ def main(argv=None):
 
     def mintime():
         check_width()
-        traj, dt, ipopt_exit = run_mintime(cl_csv, args.config, python=args.tum_python)
+        traj, dt, ipopt_exit = run_mintime(cl_csv, config, python=args.tum_python)
         return traj, dt, ipopt_exit, {}
 
     def mintime_retry():
         # without the acceleration ellipse; the speeds are held to it afterwards instead
         check_width()
         changed = {'safe_traj': False}
-        with tempfile.TemporaryDirectory(prefix='build_raceline_') as work:
-            ini = ini_with(args.config, changed, os.path.join(work, 'racecar_retry.ini'))
-            traj, dt, ipopt_exit = run_mintime(cl_csv, ini, python=args.tum_python)
+        ini = ini_with(config, changed, os.path.join(work, 'racecar_retry.ini'))
+        traj, dt, ipopt_exit = run_mintime(cl_csv, ini, python=args.tum_python)
         changed['speeds'] = 'mintime speeds capped by a speed profile within the safe_traj limits'
         return speed_profile(traj, v_cap=traj[:, 5], **limits), dt, ipopt_exit, changed
 
@@ -168,6 +220,8 @@ def main(argv=None):
                   'lap_s': round(t_lap, 2), 'min_clearance_m': round(clearance, 3),
                   'built': datetime.datetime.now().astimezone().isoformat(timespec='seconds'),
                   'track': args.name, 'config': os.path.abspath(args.config)}
+    if overrides:
+        provenance['overrides'] = overrides
     write_raceline(rl_csv, traj, provenance)
     print(f'      {method}: {len(traj)} points, {traj[-1, 0]:.1f} m, lap {t_lap:.2f} s, vx {traj[:, 5].min():.1f}-'
           f'{traj[:, 5].max():.1f} m/s, min wall clearance {clearance:.2f} m, solve {dt:.1f} s -> {rl_csv}')
