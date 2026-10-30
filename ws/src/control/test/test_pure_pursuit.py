@@ -19,7 +19,7 @@ import yaml
 rclpy = pytest.importorskip('rclpy')
 from ackermann_msgs.msg import AckermannDriveStamped  # noqa: E402
 from geometry_msgs.msg import PoseStamped  # noqa: E402
-from nav_msgs.msg import Path  # noqa: E402
+from nav_msgs.msg import Odometry, Path  # noqa: E402
 from rclpy.qos import DurabilityPolicy, QoSProfile  # noqa: E402
 from std_msgs.msg import Bool, String  # noqa: E402
 
@@ -78,6 +78,12 @@ def tracks_dir():
         write_raceline(d, 'fallback', xy, psi, 0.25, 4.0, fallback)
         x = np.arange(0.0, 20.0, 0.2)
         write_raceline(d, 'negative_vx', np.column_stack([x, np.zeros_like(x)]), np.zeros_like(x), 0.0, -3.0)
+        write_raceline(d, 'ramp', np.column_stack([x, np.zeros_like(x)]), np.zeros_like(x), 0.0, 1.0 + 0.2 * x)
+        for name, length in (('sectors', 2 * np.pi * 4.0), ('stale_sectors', 30.0)):
+            xy, psi = circle(4.0, 200)
+            write_raceline(d, name, xy, psi, 0.25, 4.0)
+            with open(os.path.join(d, name, 'sectors.yaml'), 'w') as f:
+                f.write(f'length_m: {length}\nscales: [1.0, 1.5]\n')
         yield d
 
 
@@ -113,6 +119,7 @@ class Driver:
     def __init__(self, node):
         self.node = node
         self.pub = node.create_publisher(PoseStamped, '/localized_pose', 10)
+        self.odom_pub = node.create_publisher(Odometry, '/odom', 10)
         self.drives = []
         self.sub = node.create_subscription(AckermannDriveStamped, '/drive', self.drives.append, 10)
 
@@ -123,10 +130,10 @@ class Driver:
             assert time.time() < end, 'pure_pursuit_node did not subscribe to /localized_pose'
             rclpy.spin_once(self.node, timeout_sec=0.1)
 
-    def drive(self, x, y, yaw, n=10, frame='map', age=0.0, q=None):
+    def drive(self, x, y, yaw, n=10, frame='map', age=0.0, q=None, odom=None):
         """Publish the same pose n times, stamped age s ago, and return the last /drive.
 
-        q: (x, y, z, w) quaternion instead of the one of yaw."""
+        q: (x, y, z, w) quaternion instead of the one of yaw. odom: (speed, yaw rate) on /odom before each pose."""
         self.drives.clear()
         msg = PoseStamped()
         msg.header.frame_id = frame
@@ -136,6 +143,11 @@ class Driver:
             o = msg.pose.orientation
             o.x, o.y, o.z, o.w = map(float, q)
         for _ in range(n):
+            if odom is not None:
+                o = Odometry()
+                o.header.stamp = self.node.get_clock().now().to_msg()
+                o.twist.twist.linear.x, o.twist.twist.angular.z = map(float, odom)
+                self.odom_pub.publish(o)
             t = self.node.get_clock().now().nanoseconds * 1e-9 - age
             msg.header.stamp.sec, msg.header.stamp.nanosec = int(t), int((t % 1) * 1e9)
             self.pub.publish(msg)
@@ -165,6 +177,7 @@ class Driver:
 
     def close(self):
         self.node.destroy_publisher(self.pub)
+        self.node.destroy_publisher(self.odom_pub)
         self.node.destroy_subscription(self.sub)
 
 
@@ -278,12 +291,13 @@ class LocalPath:
         self.valid_pub = node.create_publisher(Bool, '/local_path/valid', 10)
 
     def send(self, dy, valid=True, n=100):
+        """dy: the shift (m, + left), or a function of x giving it."""
         msg = Path()
         msg.header.frame_id = 'map'
         msg.header.stamp = self.node.get_clock().now().to_msg()
         for x in np.arange(0.0, 20.0, 0.2)[:n]:
             pose = PoseStamped()
-            pose.pose.position.x, pose.pose.position.y = float(x), dy
+            pose.pose.position.x, pose.pose.position.y = float(x), float(dy(x) if callable(dy) else dy)
             msg.poses.append(pose)
         end = time.time() + 1.0
         while (self.path_pub.get_subscription_count() == 0 or self.valid_pub.get_subscription_count() == 0) \
@@ -436,3 +450,100 @@ def test_bad_speed_scale_rejected(tracks_dir):
         pass
     out = stop(proc)
     assert 'speed_scale must be > 0' in out
+
+
+def test_latency_compensation(run):
+    # on the line heading along it, yawing left at 1 rad/s, latency 0.2 s: before any command of its own acts, the
+    # prediction turns with the /odom yaw rate, so the car points left of the line 0.2 s on and steers right now.
+    # (After that it drives the commands in flight: test_profile.py, test_closed_loop.py.) Each case on a fresh
+    # node: the commands it sent would be in flight
+    steering = {}
+    for name, args, odom in (('off', [], (3.0, 1.0)), ('on', ['latency:=0.2'], (3.0, 1.0)),
+                             ('no_yaw_rate', ['latency:=0.2'], (3.0, 0.0)), ('stale_odom', ['latency:=0.2'], None)):
+        driver, proc = run('straight', *args)
+        end = time.time() + 10.0
+        while args and driver.odom_pub.get_subscription_count() == 0 and time.time() < end:   # /odom matched
+            rclpy.spin_once(driver.node, timeout_sec=0.05)
+        steering[name] = driver.drive(5.0, 0.0, 0.0, n=1, odom=odom).steering_angle
+        out = stop(proc)
+        assert out.count('Traceback') == out.count('] KeyboardInterrupt'), out
+    assert steering['off'] == pytest.approx(0.0, abs=1e-6)
+    assert steering['on'] < -0.05
+    assert steering['no_yaw_rate'] == pytest.approx(0.0, abs=1e-3)
+    assert steering['stale_odom'] == pytest.approx(0.0, abs=1e-3)   # no /odom: no prediction
+
+
+def test_speed_preview(run):
+    # vx = 1 + 0.2 x (x 0.5). At x = 5.05 the closest point is x = 5 (1.0 m/s), the target the first point
+    # lookahead 0.6 m + 0.05 m away, x = 5.8 (1.08 m/s)
+    drives = []
+    for args in ([], ['speed_preview_time:=0.0'], ['speed_preview_time:=1.0']):
+        driver, proc = run('ramp', *args)
+        drives.append(driver.drive(5.05, 0.0, 0.0))
+        out = stop(proc)
+        assert out.count('Traceback') == out.count('] KeyboardInterrupt'), out
+    target, here, ahead = drives
+    assert target.speed == pytest.approx(0.5 * (1 + 0.2 * 5.8), abs=1e-3)
+    assert here.speed == pytest.approx(0.5 * (1 + 0.2 * 5.0), abs=1e-3)
+    assert ahead.speed == pytest.approx(0.5 * (1 + 0.2 * 6.0), abs=1e-3)   # 1.0 m/s x 1 s on
+    assert target.steering_angle == here.steering_angle == ahead.steering_angle == pytest.approx(0.0, abs=1e-6)
+
+
+def test_accel_feedforward(run):
+    def planned(x):   # the profile's acceleration from the point at x to the next (0.2 m on)
+        v0, v1 = 0.5 * (1 + 0.2 * x), 0.5 * (1 + 0.2 * (x + 0.2))
+        return (v1 ** 2 - v0 ** 2) / (2 * 0.2)
+    drives = []
+    for args in ([], ['accel_feedforward:=true'], ['accel_feedforward:=true', 'max_speed:=0.5']):
+        driver, proc = run('ramp', *args)
+        drives.append(driver.drive(5.05, 0.0, 0.0))   # target x = 5.8 (test_speed_preview)
+        out = stop(proc)
+        assert out.count('Traceback') == out.count('] KeyboardInterrupt'), out
+    off, on, held = drives
+    assert off.acceleration == 0.0
+    assert on.acceleration == pytest.approx(planned(5.8), rel=1e-3) and on.speed == off.speed
+    assert held.acceleration == 0.0 and held.speed == pytest.approx(0.5)   # held at max_speed: no acceleration
+
+
+def test_sector_speeds(run):
+    # sectors.yaml: [1.0, 1.5] over the circle (s = 0 at angle 0, counter-clockwise): 2.0 m/s in the first half,
+    # 3.0 m/s in the second away from its ends
+    first, second = (0.0, 4.0, math.pi), (0.0, -4.0, 0.0)
+    driver, proc = run('sectors')
+    assert driver.drive(*first).speed == pytest.approx(2.0) and driver.drive(*second).speed == pytest.approx(2.0)
+    out = stop(proc)
+    assert out.count('Traceback') == out.count('] KeyboardInterrupt'), out
+    driver, proc = run('sectors', 'sector_speeds:=true')
+    assert driver.drive(*first).speed == pytest.approx(2.0)
+    assert driver.drive(*second).speed == pytest.approx(3.0)
+
+
+def test_sector_speeds_for_another_raceline_rejected(tracks_dir):
+    proc = launch(tracks_dir, 'stale_sectors', 'sector_speeds:=true')
+    try:
+        proc.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        pass
+    out = stop(proc)
+    assert 'was made for a 30.00 m raceline' in out
+
+
+def test_avoid_swerve_speed_cap(run, local_path):
+    # /local_path swerves 0.5 m left between x = 6 and 7 (quintic smoothstep). The raceline speed is 1.5 m/s;
+    # with avoid_max_lateral_accel the car slows for the swerve (0.1 m/s^2 where it curves most, ~1.5 / m at
+    # x = 6.2: ~0.3 m/s), not on the straight before it
+    def swerve(x):
+        u = min(max(x - 6.0, 0.0), 1.0)
+        return 0.5 * (10 * u ** 3 - 15 * u ** 4 + 6 * u ** 5)
+    speeds = []
+    for args in (['avoid:=true'], ['avoid:=true', 'avoid_max_lateral_accel:=0.1']):
+        driver, proc = run('straight', *args)
+        local_path.send(swerve)
+        far = driver.drive(1.0, 0.0, 0.0, n=3).speed
+        local_path.send(swerve)
+        speeds.append((far, driver.drive(6.2, swerve(6.2), 0.3, n=3).speed))
+        out = stop(proc)
+        assert out.count('Traceback') == out.count('] KeyboardInterrupt'), out
+    (far_off, in_off), (far_on, in_on) = speeds
+    assert far_off == in_off == far_on == pytest.approx(1.5)
+    assert 0.0 < in_on < 0.6

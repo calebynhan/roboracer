@@ -2,7 +2,8 @@
 
     ros2 launch control race.launch.py track:=<name> [speed_scale:=0.5] [max_speed:=0.0] [pose_topic:=/localized_pose]
         [avoid:=false] [localizer:=cartographer|mcl] [adaptive_lookahead:=true] [adaptive_lookahead_cut:=0.1]
-        [adaptive_lookahead_min_time:=0.25]
+        [adaptive_lookahead_min_time:=0.25] [latency:=0.0] [speed_preview_time:=-1.0] [accel_feedforward:=false]
+        [sector_speeds:=false] [avoid_max_lateral_accel:=0.0] [vehicle:=<vehicle.yaml>] [safety:=false]
 
 Needs tracks/<name>/map.pbstream (map.yaml for localizer:=mcl) and raceline.csv (ws/scripts/map_track.sh
 <name>), and the car at the pose mapping started from (ws/scripts/race.sh resets the sim car there).
@@ -12,7 +13,9 @@ particle cloud has converged), so the car waits for that. localizer:=mcl is the 
 avoid:=true also starts planning's obstacle_spliner_node on the track's raceline and map, and pure
 pursuit follows its /local_path around obstacles the map did not have (stopping when there is none).
 adaptive_lookahead:=true (the default) caps pure pursuit's lookahead by the curvature of the raceline ahead (see
-pure_pursuit_node), for tight corners at full speed.
+pure_pursuit_node), for tight corners at full speed. latency, speed_preview_time, accel_feedforward,
+sector_speeds, avoid_max_lateral_accel: off by default (pure_pursuit_node). vehicle: the car's vehicle.yaml.
+safety:=true also starts the emergency brake (control safety_node, /safety/drive; on the car car.launch.py does).
 """
 import os
 
@@ -61,10 +64,29 @@ def generate_launch_description():
                               description='with adaptive_lookahead: corner cut [m], lookahead <= sqrt(2 cut / kappa)'),
         DeclareLaunchArgument('adaptive_lookahead_min_time', default_value='0.25',
                               description='with adaptive_lookahead: but lookahead >= min_time x speed [s]'),
+        DeclareLaunchArgument('latency', default_value='0.0',
+                              description="s the pose is predicted ahead (fit_vehicle's delay); 0 = off"),
+        DeclareLaunchArgument('speed_preview_time', default_value='-1.0',
+                              description="s of preview for the speed, at the car's point; < 0 = at the target"),
+        DeclareLaunchArgument('accel_feedforward', default_value='false',
+                              description="the profile's acceleration in /drive (adapter speed_ka)"),
+        DeclareLaunchArgument('sector_speeds', default_value='false',
+                              description="speeds x tracks/<track>/sectors.yaml (control tune_sectors)"),
+        DeclareLaunchArgument('avoid_max_lateral_accel', default_value='0.0',
+                              description="with avoid: m/s^2 on a swerve, speed <= sqrt(this / kappa); 0 = off"),
+        DeclareLaunchArgument('vehicle',
+                              default_value=PathJoinSubstitution([FindPackageShare('control'), 'config',
+                                                                  'vehicle.yaml']),
+                              description='vehicle.yaml: wheelbase and steering lock'),
+        DeclareLaunchArgument('safety', default_value='false',
+                              description='also start the emergency brake (safety_node; car.launch.py on the car)'),
+        Node(package='control', executable='safety_node', name='safety_node', output='screen',
+             parameters=[LaunchConfiguration('vehicle')], condition=IfCondition(LaunchConfiguration('safety'))),
         include('perception', 'localization.launch.py', ['track'], UnlessCondition(use_mcl)),
         include('perception', 'mcl.launch.py', ['track'], IfCondition(use_mcl)),
         include('control', 'pure_pursuit.launch.py', [
             'track', 'pose_topic', 'speed_scale', 'max_speed', 'avoid',
-            'adaptive_lookahead', 'adaptive_lookahead_cut', 'adaptive_lookahead_min_time']),
+            'adaptive_lookahead', 'adaptive_lookahead_cut', 'adaptive_lookahead_min_time', 'vehicle',
+            'latency', 'speed_preview_time', 'accel_feedforward', 'sector_speeds', 'avoid_max_lateral_accel']),
         OpaqueFunction(function=obstacle_spliner),
     ])

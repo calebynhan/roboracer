@@ -36,13 +36,33 @@ around an obstacle, one per raceline point) instead of the raceline; speeds stay
 path yet, a path older than max_path_age s, one of another length, or /local_path/valid false (no
 collision-free path) gets a stop command.
 
+Off by default (turn each on alone and compare with lap_logger_node; control/README.md):
+  latency             s: a command acts on the car this much later (fit_vehicle measures the delay), so the pose
+                      is first driven forward to then (from its stamp: its age too), with the commands this node
+                      sent that act meanwhile (curvature tan(steering) / wheelbase; a Smith predictor) at the
+                      /odom speed. With an uncalibrated steering, calibrate first (adapter steering_gain / the VESC
+                      servo gain): the prediction assumes it. Pure pursuit turns in early, and a delay up to
+                      ~0.1 s offsets some of that, so there leave it off; from ~0.15 s plain pure pursuit weaves
+                      and compensated it tracks as without delay (test_closed_loop.py)
+  speed_preview_time  s: the speed is the profile's at the car's closest point plus planned speed x this many s,
+                      instead of at the target point (which brakes early into corners and runs over the profile
+                      out of them); < 0 = off
+  accel_feedforward   /drive acceleration = the profile's acceleration at that point (for the sim adapter's
+                      speed_ka); 0 while max_speed or the swerve cap holds the speed
+  sector_speeds       the speed profile x a scale per sector from tracks/<track>/sectors.yaml (tune_sectors),
+                      kept within the raceline's own acceleration and braking where the scales change
+  avoid_max_lateral_accel  m/s^2: with avoid, where /local_path leaves the raceline the speed is capped at
+                      sqrt(this / its curvature), braking into it at avoid_max_decel; 0 = off
+
 Which line it drives: on start it logs the raceline's provenance (build_raceline's '# raceline:' header
 line: method, solver, fallbacks) and WARNs unless it is a clean TUM mintime line, also when the
 provenance is unknown (older or hand-made files). /raceline/provenance (latched String) repeats it.
 """
 import json
 import os
+import signal
 import time
+from collections import deque
 
 import numpy as np
 import rclpy
@@ -52,16 +72,20 @@ from rclpy.qos import DurabilityPolicy, QoSProfile
 from rclpy.signals import SignalHandlerOptions
 from ackermann_msgs.msg import AckermannDriveStamped
 from geometry_msgs.msg import PoseStamped
-from nav_msgs.msg import Path
+from nav_msgs.msg import Odometry, Path
 from std_msgs.msg import Bool, String
 
 from perception.tracks import track_dir
 from planning.raceline import read_provenance
 
-from control.lookahead import curvature_cap, lookahead
+from control.lookahead import curvature_cap, lookahead, path_curvature
+from control.profile import (SECTORS_FILE, arc_lengths, predict_with_commands, profile_accelerations, read_sectors,
+                             speed_profile, swerve_cap)
 
 # raceline.csv columns: s_m; x_m; y_m; psi_rad; kappa_radpm; vx_mps; ax_mps2
 X, Y, VX = 1, 2, 5
+MAX_ODOM_AGE = 0.2   # s: an older /odom is not used to predict the pose
+SHIFTED = 0.01       # m: a /local_path point this far off the raceline is part of a swerve
 
 
 class PurePursuit(Node):
@@ -90,6 +114,14 @@ class PurePursuit(Node):
         self.max_offset = p('max_offset', 3.0).value       # m from the line, farther = bad pose
         self.avoid = p('avoid', False).value               # follow /local_path instead of the raceline
         self.max_path_age = p('max_path_age', 0.5).value   # s
+        self.latency = p('latency', 0.0).value             # s the pose is predicted ahead, 0 = off
+        odom_topic = p('odom_topic', '/odom').value
+        self.speed_preview_time = p('speed_preview_time', -1.0).value   # s, < 0: the speed at the target point
+        self.accel_ff = p('accel_feedforward', False).value           # the profile's acceleration in /drive
+        sector_speeds = p('sector_speeds', False).value                # x tracks/<track>/sectors.yaml
+        sectors_path = p('sectors_path', '').value                     # overrides that file
+        self.avoid_max_ay = p('avoid_max_lateral_accel', 0.0).value   # m/s^2 on a swerve, 0 = off
+        self.avoid_max_decel = p('avoid_max_decel', 3.5).value        # m/s^2 braking into it
         # vehicle geometry comes only from config/vehicle.yaml (pure_pursuit.launch.py loads it)
         self.max_steering_angle = p('max_steering_angle', Parameter.Type.DOUBLE).value
         self.wheelbase = p('wheelbase', Parameter.Type.DOUBLE).value
@@ -116,8 +148,28 @@ class PurePursuit(Node):
         self.window = max(1, int(np.ceil(search_window / step))) if step > 0 else len(self.xy)
         self.cap = (curvature_cap(self.xy, la_cut, la_slope, self.lookahead_min, self.lookahead_distance, la_smooth)
                     if adaptive else np.full(len(self.xy), np.inf))
+        self.ds, self.s, self.length = arc_lengths(self.xy)
+        self.step_m = max(float(np.median(self.ds)), 1e-6)
+        scales = None
+        if sector_speeds:
+            sectors_path = sectors_path or os.path.join(track_dir(track), SECTORS_FILE)
+            if not os.path.isfile(sectors_path):
+                self.get_logger().fatal(f'sector_speeds: {sectors_path} not found (control tune_sectors writes it)')
+                raise FileNotFoundError(sectors_path)
+            scales, made_for = read_sectors(sectors_path)
+            if made_for is not None and abs(made_for - self.length) > 0.01 * self.length:
+                self.get_logger().fatal(f'{sectors_path} was made for a {made_for:.2f} m raceline, this one is '
+                                        f'{self.length:.2f} m (re-planned?): delete it or tune again')
+                raise ValueError(sectors_path)
+            self.get_logger().info(f'Sector speeds from {sectors_path}: {len(scales)} sectors, scales '
+                                   f'{min(scales):.3f}-{max(scales):.3f}')
+        self.v_plan = speed_profile(self.waypoints[:, VX], self.ds, self.s, self.length, self.speed_scale, scales)
+        self.a_plan = profile_accelerations(self.v_plan, self.ds)
         self.closest = None
         self.path_xy, self.path_stamp, self.path_valid = None, 0.0, False
+        self.path_cap = None       # speed cap per /local_path point (avoid_max_lateral_accel)
+        self.odom = None           # (clock time, speed, yaw rate) of the newest /odom, for latency
+        self.sent = deque(maxlen=200)   # (clock time, steering) of the commands sent, for latency
         self.last_pose = None      # s, clock time of the last pose that got a command
         self.get_logger().info(f'Loaded {path}: {len(self.waypoints)} points; lookahead '
                                f'{self.lookahead_time} s x speed, {self.lookahead_min}-{self.lookahead_distance} m'
@@ -126,6 +178,12 @@ class PurePursuit(Node):
                                   if adaptive else ''))
         self.report_provenance(path)
 
+        if self.latency > 0:
+            # first: rclpy runs subscriptions that are ready together in creation order, so an /odom that came with
+            # a pose is in before the pose is predicted with it
+            self.create_subscription(Odometry, odom_topic, self.odom_callback, 10)
+            self.get_logger().info(f'Latency compensation: the pose is predicted {self.latency:.3f} s (+ its age) '
+                                   f'ahead on {odom_topic}')
         self.create_subscription(PoseStamped, pose_topic, self.pose_callback, 10)
         self.drive_pub = self.create_publisher(AckermannDriveStamped, '/drive', 10)
         if self.avoid:
@@ -145,7 +203,10 @@ class PurePursuit(Node):
         with open(path) as f:
             comments = [ln.strip() for ln in f if ln.startswith('#')][:3]
         if prov is not None and prov.get('clean') and prov.get('method') == 'mintime':
-            text = (f"Raceline: TUM mintime, converged with the default settings ({prov.get('solver')}), "
+            config = os.path.basename(prov.get('config') or 'racecar.ini')
+            settings = ('the default settings' if not prov.get('overrides') else
+                        f"{config} + overrides {json.dumps(prov['overrides'])}")
+            text = (f"Raceline: TUM mintime, converged with {settings} ({prov.get('solver')}), "
                     f"lap {prov.get('lap_s')} s, built {prov.get('built')}")
             self.get_logger().info(text)
         elif prov is not None:
@@ -171,12 +232,21 @@ class PurePursuit(Node):
             return
         self.path_xy = np.array([[q.pose.position.x, q.pose.position.y] for q in msg.poses])
         self.path_stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
+        if self.avoid_max_ay > 0:
+            shifted = np.hypot(*(self.path_xy - self.xy).T) > SHIFTED
+            self.path_cap = swerve_cap(path_curvature(self.path_xy, 0.5), shifted, self.s, self.length,
+                                       self.avoid_max_ay, self.avoid_max_decel)
+
+    def odom_callback(self, msg: Odometry):
+        v, w = msg.twist.twist.linear.x, msg.twist.twist.angular.z
+        if np.isfinite([v, w]).all():
+            self.odom = (self.now(), v, w)
 
     def valid_callback(self, msg: Bool):
         self.path_valid = msg.data
 
     def drive_speed(self, i):
-        v = max(self.waypoints[i, VX] * self.speed_scale, 0.0)   # never reverse
+        v = self.v_plan[i]   # vx x speed_scale (x the sector's scale), never negative
         return min(v, self.max_speed) if self.max_speed > 0 else v
 
     def now(self):
@@ -197,6 +267,7 @@ class PurePursuit(Node):
         drive.header.stamp = self.get_clock().now().to_msg()
         drive.header.frame_id = 'base_link'
         self.drive_pub.publish(drive)   # speed 0, steering 0
+        self.sent.append((self.now(), 0.0))
 
     def find_closest(self, dists, yaw):
         n = len(self.xy)
@@ -226,6 +297,12 @@ class PurePursuit(Node):
         if age > self.max_pose_age:
             return self.stop(f'pose {age:.2f} s old')
         yaw = np.arctan2(2 * (qw * qz + qx * qy), 1 - 2 * (qy ** 2 + qz ** 2))
+        if self.latency > 0 and self.odom is not None and self.now() - self.odom[0] <= MAX_ODOM_AGE:
+            # where the car will be when this command acts: from the pose's stamp to latency s from now, with the
+            # commands sent meanwhile
+            now = self.now()
+            x, y, yaw = predict_with_commands((x, y, yaw), self.odom[1], self.odom[2], now - max(age, 0.0),
+                                              now + self.latency, self.sent, self.latency, self.wheelbase)
 
         xy = self.xy
         if self.avoid:
@@ -274,15 +351,27 @@ class PurePursuit(Node):
         target_y = -dx * np.sin(yaw) + dy * np.cos(yaw)
         steering = np.arctan(self.wheelbase * 2 * target_y / target_dist ** 2)
 
-        speed = self.drive_speed(target)
-        if not (np.isfinite(steering) and np.isfinite(speed)):
+        if self.speed_preview_time >= 0:
+            at = (closest + int(round(self.drive_speed(closest) * self.speed_preview_time / self.step_m))) % n
+        else:
+            at = target
+        speed = self.drive_speed(at)
+        held = self.max_speed > 0 and self.v_plan[at] > self.max_speed
+        if self.avoid and self.path_cap is not None:
+            cap = min(self.path_cap[closest], self.path_cap[at])
+            if cap < speed:
+                speed, held = cap, True
+        accel = float(self.a_plan[at]) if self.accel_ff and not held else 0.0
+        if not (np.isfinite(steering) and np.isfinite(speed) and np.isfinite(accel)):
             return self.stop(f'non-finite command: steering {steering}, speed {speed}')
         drive = AckermannDriveStamped()
         drive.header.stamp = self.get_clock().now().to_msg()
         drive.header.frame_id = 'base_link'
         drive.drive.steering_angle = float(np.clip(steering, -self.max_steering_angle, self.max_steering_angle))
         drive.drive.speed = float(speed)
+        drive.drive.acceleration = accel
         self.drive_pub.publish(drive)
+        self.sent.append((self.now(), drive.drive.steering_angle))
 
 
 def main():
@@ -295,6 +384,9 @@ def main():
             rclpy.spin_once(node, timeout_sec=0.1)
     except KeyboardInterrupt:
         pass
+    # Ctrl-C reaches the whole process group and ros2 launch then forwards another SIGINT: one arriving during the
+    # stops below cut them short (a single stop, then the car kept its last command), so they are ignored now
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
     for _ in range(10):   # always leave the car stopped: 0.5 s of 20 Hz stops, so the adapter brakes
         node.stop('shutting down')
         time.sleep(0.05)
