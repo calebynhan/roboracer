@@ -28,6 +28,8 @@ setup(
             'follow_the_gap_node = control.follow_the_gap_node:main',
             'disparity_gap_node = control.disparity_gap_node:main',
             'wall_follow_node = control.wall_follow_node:main',
+            'lap_logger_node = control.lap_logger_node:main',
+            'lap_summary = control.lap_summary:main',
         ],
     },
 )
