@@ -6,7 +6,7 @@ from nav_msgs.msg import Odometry
 from sensor_msgs.msg import Imu, LaserScan
 from rclpy.time import Time
 
-from autodrive_bridge.adapter import Adapter, move_towards
+from autodrive_bridge.adapter import Adapter, compensate_steering, move_towards
 
 DT = 0.01   # pure pursuit sends /drive at ~100 Hz
 
@@ -48,14 +48,15 @@ def node():
     n.destroy_node()
 
 
-def drive(node, speed, dt=DT, steer=0.0):
-    """One /drive dt seconds after the last; returns the throttle sent."""
+def drive(node, speed, dt=DT, steer=0.0, accel=0.0, topic='drive'):
+    """One /drive (topic 'safety': /safety/drive) dt seconds after the last; returns the throttle sent."""
     node.fake_clock.ns += int(round(dt * 1e9))
     msg = AckermannDriveStamped()
     msg.drive.speed = float(speed)
     msg.drive.steering_angle = float(steer)
-    node.drive_cb(msg)
-    return node.throttle_pub.data[-1]
+    msg.drive.acceleration = float(accel)
+    (node.drive_cb if topic == 'drive' else node.safety_cb)(msg)
+    return node.throttle_pub.data[-1] if node.throttle_pub.data else None
 
 
 def test_move_towards():
@@ -219,3 +220,70 @@ def test_held_while_another_adapter_runs(node):
     node.lidar_cb(LaserScan())
     node.sim_odom_cb(Odometry())
     assert all(p.n == 1 for p in pubs.values())
+
+
+def test_compensate_steering():
+    for gain in (0.7, 1.8):
+        for angle in (-0.4, 0.1, 0.3):
+            assert gain * math.tan(compensate_steering(angle, gain)) == pytest.approx(math.tan(angle))
+    for gain in (1.0, 0.0, -1.0, math.nan):
+        assert compensate_steering(0.3, gain) == 0.3
+
+
+def test_steering_gain(node):
+    drive(node, 2.0, steer=0.3)
+    assert node.steer_pub.data[-1] == pytest.approx(0.3 / node.max_steer)   # default 1.0: unchanged
+    node.steering_gain = 1.8   # the car turns 1.8x harder than the model: command less
+    drive(node, 2.0, steer=0.3)
+    assert node.steer_pub.data[-1] == pytest.approx(math.atan(math.tan(0.3) / 1.8) / node.max_steer)
+    drive(node, 2.0, steer=-5.0)   # past the lock: the lock's curvature (tan(-5) alone would turn left)
+    lock = node.max_steer
+    assert node.steer_pub.data[-1] == pytest.approx(-math.atan(math.tan(lock) / 1.8) / lock)
+    node.steering_gain = 0.7       # turns softer: the lock's curvature needs more than the lock
+    drive(node, 2.0, steer=-5.0)
+    assert node.steer_pub.data[-1] == -1.0
+
+
+def restart(node):
+    node.v_cmd, node.integral, node.last_ctrl_t = 0.0, 0.0, None
+
+
+def test_acceleration_feedforward_while_the_ramp_limits(node):
+    base = drive(node, 4.45)   # from rest: the ramp holds the speed back
+    restart(node)
+    node.ka = 0.05
+    assert drive(node, 4.45) == pytest.approx(base + 0.05 * node.max_accel)
+
+
+def test_acceleration_feedforward_from_drive(node):
+    node.vx = 4.0
+    for _ in range(50):
+        drive(node, 4.0)
+    base = drive(node, 4.0, accel=1.5)   # ka 0: the acceleration field is ignored
+    assert drive(node, 4.0) == pytest.approx(base, abs=1e-9)
+    node.ka, node.ka_brake = 0.05, 0.02
+    assert drive(node, 4.0, accel=1.5) == pytest.approx(base + 0.05 * 1.5, abs=1e-6)
+    assert drive(node, 4.0, accel=-2.0) == pytest.approx(base - 0.02 * 2.0, abs=1e-6)
+    assert drive(node, 4.0, accel=50.0) == pytest.approx(base + 0.05 * node.max_accel, abs=1e-6)   # clipped
+    assert drive(node, 4.0, accel=math.nan) == pytest.approx(base, abs=1e-6)
+
+
+def test_safety_command_overrides_drive(node):
+    node.vx = 3.0
+    for _ in range(20):
+        drive(node, 3.0)
+    n = len(node.throttle_pub.data)
+    drive(node, 0.0, topic='safety')
+    assert len(node.throttle_pub.data) == n + 1 and node.v_cmd < 3.0   # braking toward 0
+    drive(node, 3.0)                                                     # /drive ignored meanwhile
+    assert len(node.throttle_pub.data) == n + 1
+    drive(node, 3.0, dt=0.25)                                            # safety_timeout (0.2 s) after it
+    assert len(node.throttle_pub.data) == n + 2
+
+
+def test_acceleration_feedforward_with_no_time_between_commands(node):
+    # two commands at the same clock time (sim time, a /drive and a /safety/drive together): dt 0 must not divide
+    node.ka = 0.05
+    drive(node, 4.45)
+    throttle = drive(node, 4.45, dt=0.0)
+    assert math.isfinite(throttle)

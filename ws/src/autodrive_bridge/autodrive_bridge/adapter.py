@@ -10,6 +10,16 @@ The throttle loop stands in for the VESC's speed control and for f1tenth_system'
 limit on the /drive speed. Its measured speed comes from /odom (wheel_odom in sim, vesc_to_odom
 on the car) rather than AutoDRIVE ground truth. The sim throttle is motor torque
 (VehicleController); ~25 m/s per unit throttle is its steady state.
+
+steering_gain: the sim's counterpart of the VESC's steering_angle_to_servo_gain on the car. The car's path
+curvature is steering_gain x tan(command) / wheelbase (control fit_vehicle measures it; 1.0 = the bicycle model),
+so the adapter commands atan(tan(angle) / steering_gain): a /drive angle then drives the curvature every controller
+assumes. speed_ka / speed_ka_brake: throttle per m/s^2 of acceleration, on top of the speed feedforward (the
+throttle is torque, so an acceleration needs its own term; fit_vehicle fits them): the ramp's own acceleration
+while it holds the speed back, else /drive's acceleration field (pure pursuit's accel_feedforward). 0 = off.
+
+safety_topic (/safety/drive, control's safety_node): an emergency command there overrides /drive for
+safety_timeout s after each one, as the higher-priority input of f1tenth_system's ackermann_mux on the car.
 """
 import math
 import signal
@@ -38,6 +48,14 @@ def quat_from_yaw(yaw):
     return 0.0, 0.0, math.sin(yaw / 2.0), math.cos(yaw / 2.0)
 
 
+def compensate_steering(angle, gain):
+    """The angle to command so a car whose path curvature is gain x tan(command) / wheelbase drives
+    tan(angle) / wheelbase (gain 1, or not positive and finite: unchanged)."""
+    if not (math.isfinite(gain) and gain > 0) or gain == 1.0:
+        return angle
+    return math.atan(math.tan(angle) / gain)
+
+
 def move_towards(current, target, max_change):
     """current moved toward target by at most max_change (ActuationLimiter in ForzaETH's f1tenth_system)."""
     return current + max(-max_change, min(max_change, target - current))
@@ -57,6 +75,10 @@ class Adapter(Node):
         self.camera_x = p('camera_x', -0.015).value
         self.camera_z = p('camera_z', 0.15).value
         self.kff = p('speed_kff', 0.04).value                     # throttle per m/s (1 / 25)
+        self.ka = p('speed_ka', 0.0).value                        # throttle per m/s^2 accelerating, 0 = off
+        self.ka_brake = p('speed_ka_brake', 0.0).value            # ... braking
+        self.steering_gain = p('steering_gain', 1.0).value        # measured / bicycle-model curvature
+        self.safety_timeout = p('safety_timeout', 0.2).value      # s a safety command overrides /drive
         self.kp = p('speed_kp', 0.006).value
         self.kp_brake = p('speed_kp_brake', 0.1).value            # kp when too fast: negative throttle brakes
         self.ki = p('speed_ki', 0.006).value
@@ -83,6 +105,8 @@ class Adapter(Node):
         self.create_subscription(LaserScan, self.ns + '/lidar', self.lidar_cb, qos)
         self.create_subscription(Odometry, self.odom_topic, self.odom_cb, 10)
         self.create_subscription(AckermannDriveStamped, '/drive', self.drive_cb, 10)
+        self.create_subscription(AckermannDriveStamped, p('safety_topic', '/safety/drive').value,
+                                 self.safety_cb, 10)
 
         self.scan_pub = self.create_publisher(LaserScan, '/scan', 10)
         self.imu_pub = self.create_publisher(Imu, '/sensors/imu/raw', 10)
@@ -99,6 +123,7 @@ class Adapter(Node):
         self.v_cmd = 0.0              # /drive speed after the acceleration limit
         self.integral = 0.0
         self.last_ctrl_t = None
+        self.safety_t = None          # clock time of the last safety command
         self.stuck_since = None       # auto_unstick state
         self.reverse_until = None
         # A second adapter (an overlapping bridge restart) holds its output while this one runs: its
@@ -110,7 +135,9 @@ class Adapter(Node):
         # Commands go out as each /drive arrives (drive_cb), so the bridge's next reply to the sim
         # carries it. A 50 Hz command timer used to add ~10 ms and drop 2/3 of pure pursuit's
         # commands. When /drive goes quiet, fast_bridge zeroes the commands after its cmd_timeout.
-        self.get_logger().info(f'AutoDRIVE adapter up on {self.ns}')
+        self.get_logger().info(
+            f'AutoDRIVE adapter up on {self.ns}: steering_gain {self.steering_gain}, speed ramp +{self.max_accel} / '
+            f'-{self.max_decel} m/s^2, speed_ka {self.ka} / {self.ka_brake}')
 
     # ---------------- sensors -> stack ----------------
     def make_static_tf(self, child, position, orientation=(0.0, 0.0, 0.0, 1.0)):
@@ -186,8 +213,28 @@ class Adapter(Node):
         self.scan_pub.publish(msg)  # keeps fast_bridge's stamp, the sim frame the scan arrived in
 
     # ---------------- stack -> AutoDRIVE ----------------
+    def safety_active(self):
+        if self.safety_t is None:
+            return False
+        return (self.get_clock().now() - self.safety_t).nanoseconds * 1e-9 <= self.safety_timeout
+
     def drive_cb(self, msg):
-        """Throttle (speed PI + feedforward) and normalized steering for each /drive."""
+        """/drive, unless a safety command came within safety_timeout s."""
+        if not self.safety_active():
+            self.command(msg)
+
+    def safety_cb(self, msg):
+        """An emergency command (control's safety_node): driven, and /drive ignored for safety_timeout s."""
+        if not self.guard.ok:
+            return
+        if not self.safety_active():
+            self.get_logger().warning(f'safety command (speed {msg.drive.speed:.2f}): overriding /drive',
+                                      throttle_duration_sec=1.0)
+        self.safety_t = self.get_clock().now()
+        self.command(msg)
+
+    def command(self, msg):
+        """Throttle (speed PI + feedforward) and normalized steering for each command."""
         if not self.guard.ok:
             return
         v_ref = float(msg.drive.speed)
@@ -245,6 +292,14 @@ class Adapter(Node):
         # a one-frame stop from restarting the ramp at 0 while the car is fast.
         rate = self.max_accel if v_ref > self.v_cmd else self.max_decel
         self.v_cmd = move_towards(self.v_cmd, v_ref, rate * dt)
+        # acceleration feedforward: the ramp's (its rate, toward v_ref) while it holds the speed back, else the
+        # planned one in /drive. No division by dt: two commands can share a clock time (sim time, a safety command)
+        a_ref = float(msg.drive.acceleration)
+        if self.v_cmd != v_ref:
+            a_ff = math.copysign(rate, v_ref - self.v_cmd)
+        else:
+            a_ff = a_ref if math.isfinite(a_ref) else 0.0
+        a_ff = max(-self.max_decel, min(self.max_accel, a_ff))
 
         err = self.v_cmd - self.vx
         if abs(v_ref) < 1e-3 and abs(self.vx) < 0.05:
@@ -257,9 +312,12 @@ class Adapter(Node):
             # kp 0.006: +0.09), leaving braking to drag; a larger gain on overspeed brakes.
             kp = self.kp if err >= 0 else self.kp_brake
             throttle = self.kff * self.v_cmd + kp * err + self.ki * self.integral
+            throttle += (self.ka if a_ff >= 0 else self.ka_brake) * a_ff
         throttle = max(-self.max_throttle, min(self.max_throttle, throttle))
 
         self.throttle_pub.publish(Float32(data=float(throttle)))
+        # to the lock first: an angle past it means the lock (tan of a larger one could even flip its sign)
+        steer = compensate_steering(max(-self.max_steer, min(self.max_steer, steer)), self.steering_gain)
         self.steer_pub.publish(Float32(data=float(max(-1.0, min(1.0, steer / self.max_steer)))))
 
 

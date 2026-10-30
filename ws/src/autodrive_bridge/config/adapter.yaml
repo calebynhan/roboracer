@@ -11,6 +11,10 @@ adapter:
     speed_kp_brake: 0.03        # kp when faster than /drive: 8 -> 3 m/s gives throttle -0.03 (brakes). 0.1 turned /odom
                                 # noise (std 0.16 m/s vs ground truth) into brake taps: 88 surge/brake swings in 24 s on Porto
     speed_ki: 0.006
+    speed_ka: 0.0               # throttle per m/s^2 accelerating (control fit_vehicle fits it); 0 = no acceleration feedforward
+    speed_ka_brake: 0.0         # ... braking
+    steering_gain: 1.0          # measured / bicycle-model curvature (control fit_vehicle); 1.0 = uncalibrated
+    safety_timeout: 0.2         # s a command on /safety/drive (control safety_node) overrides /drive
     speed_i_max: 1.0
     max_throttle: 1.0
     max_acceleration: 2.5       # m/s^2 ramp on the /drive speed (ForzaETH f1tenth_system's value); traction ~5.5

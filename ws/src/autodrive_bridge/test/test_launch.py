@@ -59,9 +59,9 @@ def wait_until(cond, timeout):
     return True
 
 
-def launch(port):
+def launch(port, *args):
     env = dict(os.environ, ROS_DOMAIN_ID='77', PYTHONUNBUFFERED='1')
-    return subprocess.Popen(['ros2', 'launch', os.path.join(HERE, 'bridge_nodes_launch.py'), f'port:={port}'],
+    return subprocess.Popen(['ros2', 'launch', os.path.join(HERE, 'bridge_nodes_launch.py'), f'port:={port}', *args],
                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                             start_new_session=True)
 
@@ -131,3 +131,22 @@ def test_ctrl_c_stops_cleanly():
     assert 'escalating' not in out, out
     for name in NODES:
         assert any(f'[{name}-' in line and 'finished cleanly' in line for line in out.splitlines()), out
+
+
+def test_adapter_overrides():
+    # launch arguments override adapter.yaml for the run; left out, adapter.yaml's values stand
+    p = launch(free_port(), 'steering_gain:=1.8', 'speed_ka:=0.05', 'max_acceleration:=4.0')
+    try:
+        started(p)
+    finally:
+        out = finish(p)
+    assert 'steering_gain 1.8, speed ramp +4.0 / -6.9 m/s^2, speed_ka 0.05 / 0.0' in out, out
+
+
+def test_adapter_override_not_a_number():
+    p = launch(free_port(), 'steering_gain:=fast')
+    try:
+        p.wait(timeout=30)
+    finally:
+        out = finish(p)
+    assert 'steering_gain:=fast is not a number' in out, out
