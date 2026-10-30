@@ -30,6 +30,8 @@ setup(
             'wall_follow_node = control.wall_follow_node:main',
             'lap_logger_node = control.lap_logger_node:main',
             'lap_summary = control.lap_summary:main',
+            'sysid_recorder_node = control.sysid_recorder_node:main',
+            'fit_vehicle = control.fit_vehicle:main',
         ],
     },
 )
