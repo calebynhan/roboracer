@@ -28,6 +28,7 @@ setup(
             'corrector = perception.corrector:main',
             'localization_gate = perception.localization_gate:main',
             'mcl_node = perception.mcl_node:main',
+            'imu_odom_node = perception.imu_odom_node:main',
         ],
     },
 )
