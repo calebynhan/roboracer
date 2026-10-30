@@ -32,6 +32,7 @@ setup(
             'lap_summary = control.lap_summary:main',
             'sysid_recorder_node = control.sysid_recorder_node:main',
             'fit_vehicle = control.fit_vehicle:main',
+            'tune_sectors = control.tune_sectors:main',
             'safety_node = control.safety_node:main',
         ],
     },
