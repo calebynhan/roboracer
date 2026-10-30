@@ -14,6 +14,11 @@ RACECAR = os.path.join(HERE, '..', 'config', 'racecar.ini')
 ADAPTER = os.path.join(HERE, '..', '..', 'autodrive_bridge', 'config', 'adapter.yaml')
 
 
+# (control vehicle yaml, planning ini): the AutoDRIVE sim car, the real car
+PAIRS = [('vehicle.yaml', 'racecar.ini'), ('vehicle_car.yaml', 'racecar_car.ini')]
+
+
+@pytest.mark.parametrize('vehicle, racecar', PAIRS)
 def test_racecar_ini_matches_vehicle_yaml(vehicle, racecar):
     with open(os.path.join(os.path.dirname(VEHICLE), vehicle)) as f:
         car = yaml.safe_load(f)['/**']['ros__parameters']
@@ -26,9 +31,10 @@ def test_racecar_ini_matches_vehicle_yaml(vehicle, racecar):
     assert veh['curvlim'] == pytest.approx(math.tan(car['max_steering_angle']) / car['wheelbase'], abs=0.01)
 
 
-def test_width_opt_fits_the_car():
+@pytest.mark.parametrize('racecar', [r for _, r in PAIRS])
+def test_width_opt_fits_the_car(racecar):
     ini = configparser.ConfigParser()
-    ini.read(RACECAR)
+    assert ini.read(os.path.join(os.path.dirname(RACECAR), racecar))
     width = json.loads(ini.get('GENERAL_OPTIONS', 'veh_params'))['width']
     width_opt = json.loads(ini.get('OPTIMIZATION_OPTIONS', 'optim_opts_mintime'))['width_opt']
     assert width_opt >= width   # the car fits inside its own margin

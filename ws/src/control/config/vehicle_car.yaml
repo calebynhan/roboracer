@@ -1,0 +1,8 @@
+# The real F1TENTH car's geometry, as config/vehicle.yaml is the AutoDRIVE car's. MEASURE YOURS: these are the
+# f1tenth_gym defaults (Traxxas Slash 4x4: lf 0.15875 + lr 0.17145 m, steering lock 0.4189 rad).
+# race.launch.py / pure_pursuit.launch.py vehicle:=<this file>; car.launch.py loads it by default.
+# planning/config/racecar_car.ini mirrors them; test_vehicle_params.py checks it does.
+/**:
+  ros__parameters:
+    max_steering_angle: 0.4189  # rad, steering lock: the largest /drive angle the servo reaches
+    wheelbase: 0.3302           # m, rear axle (base_link) -> front axle

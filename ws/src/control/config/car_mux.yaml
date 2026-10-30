@@ -1,0 +1,18 @@
+# ackermann_mux inputs for f1tenth_system on the real car (f1tenth_stack config/mux.yaml): the emergency brake of
+# control safety_node (/safety/drive) above the stack's /drive and below the joystick, so the person holding the
+# deadman always wins. Copy the safety entry into f1tenth_stack's mux.yaml (or pass this file to ackermann_mux).
+ackermann_mux:
+  ros__parameters:
+    topics:
+      navigation:
+        topic: drive
+        timeout: 0.2
+        priority: 10
+      safety:
+        topic: safety/drive
+        timeout: 0.2
+        priority: 50
+      joystick:
+        topic: teleop
+        timeout: 0.2
+        priority: 100

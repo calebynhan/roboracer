@@ -11,7 +11,8 @@ __pycache__/
 ws/tracks/*
 !ws/tracks/.gitignore
 
-# ROS bags, tf2 view_frames dumps
+# ROS bags (ws/scripts/record.sh writes ws/bags/), tf2 view_frames dumps
+ws/bags/
 *.db3
 *.mcap
 rosbag2_*/
