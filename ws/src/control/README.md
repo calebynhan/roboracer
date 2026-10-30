@@ -102,10 +102,6 @@ pose on a nearby leg (iros2026's legs are 1.07 m apart) passes it. There is no `
 | `max_offset` | `3.0` | m; farther than this from the raceline, the pose is taken as bad and the car stops |
 | `avoid` | `false` | steer on `/local_path` (obstacle avoidance) instead of the raceline |
 | `max_path_age` | `0.5` | s; with `avoid`, an older `/local_path` gets a stop |
-| `latency` | `0.0` | s; the pose is predicted this far ahead (plus its own age) at the `/odom` speed and yaw rate before the target is picked; 0 = off |
-| `speed_preview_time` | `-1.0` | s; speed at the car's raceline point + planned speed x this, instead of at the target point; < 0 = off |
-| `accel_feedforward` | `false` | `/drive` acceleration = raceline `ax_mps2` x `speed_scale`^2 (the adapter's `speed_ka` uses it) |
-| `avoid_max_lateral_accel` | `0.0` | m/s^2; with `avoid`, speed <= sqrt(this / curvature of `/local_path`) between the car and the target; 0 = off |
 | `wheelbase` | none | m, from `config/vehicle.yaml` (required) |
 | `max_steering_angle` | none | rad, steering is clipped to this; from `config/vehicle.yaml` (required) |
 
@@ -135,18 +131,6 @@ With `avoid:=true` the cap is still the raceline's (per raceline point, which `/
 one), not the curvature of `/local_path`'s swerve around an obstacle.
 Sim (MCL, 2026-10-29): Porto at 1.0, 0 collisions in 23 laps of 7.00 s (off: 25 collisions in 180 s);
 Berlin at 1.0, 0 collisions, 12.38 s laps (off: 30 collisions); lap times at 0.5 unchanged.
-
-All four are off by default: turn them on one at a time and compare with `lap_logger_node` (below).
-
-## Lap benchmark
-
-`lap_logger_node` (sim only) appends one row per lap to `tracks/<name>/laps.csv`: lap time (and the sim's own),
-collisions, RMS and worst ground-truth distance from the raceline, speed tracking error, and localization error
-(`/localized_pose` against ground truth, through `map_to_world.yaml`). Each run starts with a comment line carrying `tag`.
-
-```bash
-ros2 run control lap_logger_node --ros-args -p track:=<name> -p tag:=baseline [-p laps:=10]   # next to race.sh
-```
 
 ## Wall follower
 

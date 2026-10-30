@@ -11,7 +11,6 @@ import yaml
 HERE = os.path.dirname(os.path.abspath(__file__))
 VEHICLE = os.path.join(HERE, '..', '..', 'control', 'config', 'vehicle.yaml')
 RACECAR = os.path.join(HERE, '..', 'config', 'racecar.ini')
-ADAPTER = os.path.join(HERE, '..', '..', 'autodrive_bridge', 'config', 'adapter.yaml')
 
 
 def test_racecar_ini_matches_vehicle_yaml():
@@ -32,16 +31,3 @@ def test_width_opt_fits_the_car():
     width = json.loads(ini.get('GENERAL_OPTIONS', 'veh_params'))['width']
     width_opt = json.loads(ini.get('OPTIMIZATION_OPTIONS', 'optim_opts_mintime'))['width_opt']
     assert width_opt >= width   # the car fits inside its own margin
-
-
-@pytest.mark.parametrize('profile', ['racecar.ini', 'racecar_fast.ini'])
-def test_planned_accelerations_are_what_the_adapter_drives(profile):
-    """safe_traj's acceleration ellipse must match the sim adapter's speed ramp: a plan accelerating faster than
-    max_acceleration cannot be followed, and braking harder than max_deceleration is cut short."""
-    with open(ADAPTER) as f:
-        adapter = yaml.safe_load(f)['adapter']['ros__parameters']
-    ini = configparser.ConfigParser()
-    ini.read(os.path.join(HERE, '..', 'config', profile))
-    opts = json.loads(ini.get('OPTIMIZATION_OPTIONS', 'optim_opts_mintime'))
-    assert opts['ax_pos_safe'] == pytest.approx(adapter['max_acceleration'])
-    assert abs(opts['ax_neg_safe']) <= adapter['max_deceleration']

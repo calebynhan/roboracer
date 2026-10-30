@@ -2,8 +2,7 @@
 
     ros2 launch control race.launch.py track:=<name> [speed_scale:=0.5] [max_speed:=0.0] [pose_topic:=/localized_pose]
         [avoid:=false] [localizer:=cartographer|mcl] [adaptive_lookahead:=true] [adaptive_lookahead_cut:=0.1]
-        [adaptive_lookahead_min_time:=0.25] [latency:=0.0] [speed_preview_time:=-1.0] [accel_feedforward:=false]
-        [avoid_max_lateral_accel:=0.0]
+        [adaptive_lookahead_min_time:=0.25]
 
 Needs tracks/<name>/map.pbstream (map.yaml for localizer:=mcl) and raceline.csv (ws/scripts/map_track.sh
 <name>), and the car at the pose mapping started from (ws/scripts/race.sh resets the sim car there).
@@ -62,19 +61,10 @@ def generate_launch_description():
                               description='with adaptive_lookahead: corner cut [m], lookahead <= sqrt(2 cut / kappa)'),
         DeclareLaunchArgument('adaptive_lookahead_min_time', default_value='0.25',
                               description='with adaptive_lookahead: but lookahead >= min_time x speed [s]'),
-        DeclareLaunchArgument('latency', default_value='0.0',
-                              description='s the pose is predicted ahead (actuation latency), 0 = off'),
-        DeclareLaunchArgument('speed_preview_time', default_value='-1.0',
-                              description='speed at the car + planned speed x this [s] instead of at the target; < 0 = off'),
-        DeclareLaunchArgument('accel_feedforward', default_value='false',
-                              description='raceline ax in /drive acceleration (adapter speed_ka)'),
-        DeclareLaunchArgument('avoid_max_lateral_accel', default_value='0.0',
-                              description='with avoid: speed <= sqrt(this / curvature) of /local_path [m/s^2], 0 = off'),
         include('perception', 'localization.launch.py', ['track'], UnlessCondition(use_mcl)),
         include('perception', 'mcl.launch.py', ['track'], IfCondition(use_mcl)),
         include('control', 'pure_pursuit.launch.py', [
             'track', 'pose_topic', 'speed_scale', 'max_speed', 'avoid',
-            'adaptive_lookahead', 'adaptive_lookahead_cut', 'adaptive_lookahead_min_time',
-            'latency', 'speed_preview_time', 'accel_feedforward', 'avoid_max_lateral_accel']),
+            'adaptive_lookahead', 'adaptive_lookahead_cut', 'adaptive_lookahead_min_time']),
         OpaqueFunction(function=obstacle_spliner),
     ])

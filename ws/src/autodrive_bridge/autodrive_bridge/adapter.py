@@ -28,7 +28,6 @@ from std_msgs.msg import Float32
 from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 
 from autodrive_bridge.single_instance import DuplicateGuard, exit_with_parent, topic_publishers
-from autodrive_bridge.steering_id import compensate
 
 
 def yaw_from_quat(q):
@@ -58,10 +57,6 @@ class Adapter(Node):
         self.camera_x = p('camera_x', -0.015).value
         self.camera_z = p('camera_z', 0.15).value
         self.kff = p('speed_kff', 0.04).value                     # throttle per m/s (1 / 25)
-        self.ka = p('speed_ka', 0.0).value                        # throttle per m/s^2 of /drive acceleration, 0 = off
-        # measured curvature / bicycle-model curvature (steering_monitor); /drive angles are commanded as
-        # atan(tan(angle) / steering_gain), so they drive the model's curvature. 1.0 = uncalibrated
-        self.steering_gain = p('steering_gain', 1.0).value
         self.kp = p('speed_kp', 0.006).value
         self.kp_brake = p('speed_kp_brake', 0.1).value            # kp when too fast: negative throttle brakes
         self.ki = p('speed_ki', 0.006).value
@@ -262,15 +257,9 @@ class Adapter(Node):
             # kp 0.006: +0.09), leaving braking to drag; a larger gain on overspeed brakes.
             kp = self.kp if err >= 0 else self.kp_brake
             throttle = self.kff * self.v_cmd + kp * err + self.ki * self.integral
-            # acceleration feedforward (the throttle is motor torque): the planned acceleration pure pursuit
-            # passes in /drive, within the ramp's limits, while the ramp is not holding the speed back
-            a_ref = float(msg.drive.acceleration)
-            if self.ka and math.isfinite(a_ref) and abs(self.v_cmd - v_ref) < 0.5:
-                throttle += self.ka * max(-self.max_decel, min(self.max_accel, a_ref))
         throttle = max(-self.max_throttle, min(self.max_throttle, throttle))
 
         self.throttle_pub.publish(Float32(data=float(throttle)))
-        steer = compensate(steer, self.steering_gain)
         self.steer_pub.publish(Float32(data=float(max(-1.0, min(1.0, steer / self.max_steer)))))
 
 
