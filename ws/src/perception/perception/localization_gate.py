@@ -23,7 +23,6 @@ import math
 import os
 import time
 
-import yaml
 import rclpy
 from rclpy.executors import ExternalShutdownException
 from rclpy.node import Node
@@ -36,7 +35,7 @@ from std_msgs.msg import String
 from visualization_msgs.msg import MarkerArray
 
 from perception.map_origin import pose2d
-from perception.tracks import track_dir
+from perception.tracks import read_map_to_world, world_to_map  # noqa: F401 (world_to_map: also for the tests)
 
 INTER_NS = 'Inter constraints, different trajectories'
 
@@ -44,14 +43,6 @@ INTER_NS = 'Inter constraints, different trajectories'
 def count_map_constraints(markers):
     """Constraints between trajectories in a /constraint_list (LINE_LIST: two points each)."""
     return sum(len(m.points) // 2 for m in markers.markers if m.ns == INTER_NS)
-
-
-def world_to_map(origin, x, y, yaw):
-    """Car pose in the sim world -> map frame; origin = (x, y, yaw) of the map origin in the world."""
-    ox, oy, oyaw = origin
-    c, s = math.cos(oyaw), math.sin(oyaw)
-    dx, dy = x - ox, y - oy
-    return c * dx + s * dy, -s * dx + c * dy, math.atan2(math.sin(yaw - oyaw), math.cos(yaw - oyaw))
 
 
 class LocalizationGate(Node):
@@ -68,12 +59,7 @@ class LocalizationGate(Node):
         self.still_speed = p('still_speed', 0.1).value      # m/s: the car has stopped after a reset
         self.timeout = p('timeout', 10.0).value             # s per Cartographer step
 
-        self.origin = None
-        path = os.path.join(track_dir(track), 'map_to_world.yaml')
-        if os.path.isfile(path):
-            with open(path) as f:
-                w = yaml.safe_load(f)
-            self.origin = (w['x_m'], w['y_m'], w['yaw_rad'])
+        self.origin = read_map_to_world(track)
 
         self.frozen = None            # frozen map trajectory id
         self.tid = None               # current localization trajectory
